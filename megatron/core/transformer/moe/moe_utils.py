@@ -34,6 +34,20 @@ def _minimax_fp32_unpermute_accum_enabled():
     )
 
 
+def _minimax_fp32_permute_backward_enabled():
+    return os.environ.get('MINIMAX_MOE_FP32_PERMUTE_BWD', '1').lower() not in (
+        '0',
+        'false',
+        'no',
+        'off',
+    )
+
+
+def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tensor):
+    """index_select whose backward scatter-add uses an fp32 accumulation buffer."""
+    return tokens.float().index_select(0, sorted_indices).to(tokens.dtype)
+
+
 def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
     if len(restore_shape) != 2:
         return None
@@ -451,7 +465,10 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    if not drop_and_pad and _minimax_fp32_permute_backward_enabled():
+        permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
