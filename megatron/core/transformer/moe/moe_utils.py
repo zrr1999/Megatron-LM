@@ -1366,7 +1366,10 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            grad_weight_fp32 = torch.mm(grad_output.float().t(), inp.float())
+            if hasattr(weight, "_run_torch_gate_fp32_wgrad"):
+                weight._run_torch_gate_fp32_wgrad = grad_weight_fp32
+            grad_weight = grad_weight_fp32.to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
