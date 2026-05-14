@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -23,6 +24,33 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
+
+def _minimax_fp32_unpermute_accum_enabled():
+    return os.environ.get('MINIMAX_MOE_FP32_UNPERMUTE_ACCUM', '1').lower() not in (
+        '0',
+        'false',
+        'no',
+        'off',
+    )
+
+
+def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
+    if len(restore_shape) != 2:
+        return None
+
+    hidden = int(restore_shape[-1])
+    output_tokens = torch.zeros(
+        restore_shape,
+        dtype=torch.float32,
+        device=permuted_tokens.device,
+    )
+    output_tokens.scatter_add_(
+        0,
+        sorted_indices.unsqueeze(1).expand(-1, hidden),
+        permuted_tokens.to(torch.float32),
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
+
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -482,6 +510,15 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    if (
+        _minimax_fp32_unpermute_accum_enabled()
+        and probs is None
+        and not drop_and_pad
+    ):
+        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        if fp32_output is not None:
+            return fp32_output
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
