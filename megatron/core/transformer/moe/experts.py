@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -65,24 +64,6 @@ from megatron.core.inference.moe import (
 logger = logging.getLogger(__name__)
 
 
-def _minimax_expert_plain_swiglu_enabled():
-    return os.environ.get('MINIMAX_EXPERT_PLAIN_SWIGLU', '1').lower() not in (
-        '0',
-        'false',
-        'no',
-        'off',
-    )
-
-
-def _minimax_expert_fp32_wgrad_enabled():
-    return os.environ.get('MINIMAX_EXPERT_FP32_WGRAD', '1').lower() not in (
-        '0',
-        'false',
-        'no',
-        'off',
-    )
-
-
 def _minimax_unfused_swiglu_scale(intermediate_parallel, per_token_scale, glu_offset):
     hidden = intermediate_parallel.shape[-1] // 2
     gate = intermediate_parallel[..., :hidden].to(torch.float32)
@@ -101,7 +82,6 @@ def _minimax_record_expert_wgrad_fp32(weight, input_tensor, grad_output):
         or input_tensor is None
         or grad_output is None
         or input_tensor.shape[0] == 0
-        or not _minimax_expert_fp32_wgrad_enabled()
     ):
         return
     with torch.no_grad():
@@ -853,8 +833,7 @@ class SequentialMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         use_minimax_plain_swiglu = (
-            _minimax_expert_plain_swiglu_enabled()
-            and self.num_local_experts > 1
+            self.num_local_experts > 1
             and not (self.config.fp8 or self.config.fp4)
             and self.config.gated_linear_unit
             and permuted_probs is not None

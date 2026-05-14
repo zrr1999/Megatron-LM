@@ -4,7 +4,6 @@
 from functools import partial
 from typing import Optional, Tuple
 
-import os
 import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
@@ -22,15 +21,6 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
-
-
-def _minimax_preserve_fp32_expert_bias_enabled():
-    return os.environ.get('MINIMAX_PRESERVE_FP32_EXPERT_BIAS', '1').lower() not in (
-        '0',
-        'false',
-        'no',
-        'off',
-    )
 
 
 def _iter_modules_with_expert_bias(module):
@@ -479,7 +469,7 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         expert_bias_snapshots = {}
-        if (self.fp16 or self.bf16) and _minimax_preserve_fp32_expert_bias_enabled():
+        if self.fp16 or self.bf16:
             expert_bias_snapshots = _snapshot_expert_bias_fp32(module)
 
         if self.fp16:
@@ -500,10 +490,7 @@ class Float16Module(MegatronModule):
         if expert_bias_snapshots:
             _restore_expert_bias_fp32(self.module, expert_bias_snapshots)
 
-        if (
-            _minimax_preserve_fp32_expert_bias_enabled()
-            and getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0
-        ):
+        if getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0:
             # Paddle alignment: keep router expert_bias static. Paddle has no
             # equivalent online update path; leaving it enabled changes routing
             # from step 2 onward.

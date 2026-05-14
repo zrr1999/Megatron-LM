@@ -2,7 +2,6 @@
 
 import functools
 import math
-import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -24,24 +23,6 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
-
-def _minimax_fp32_unpermute_accum_enabled():
-    return os.environ.get('MINIMAX_MOE_FP32_UNPERMUTE_ACCUM', '1').lower() not in (
-        '0',
-        'false',
-        'no',
-        'off',
-    )
-
-
-def _minimax_fp32_permute_backward_enabled():
-    return os.environ.get('MINIMAX_MOE_FP32_PERMUTE_BWD', '1').lower() not in (
-        '0',
-        'false',
-        'no',
-        'off',
-    )
-
 
 def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tensor):
     """index_select whose backward scatter-add uses an fp32 accumulation buffer."""
@@ -465,7 +446,7 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    if not drop_and_pad and _minimax_fp32_permute_backward_enabled():
+    if not drop_and_pad:
         permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
     else:
         permuted_input = tokens.index_select(0, sorted_indices)
@@ -528,11 +509,7 @@ def unpermute(
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
 
-    if (
-        _minimax_fp32_unpermute_accum_enabled()
-        and probs is None
-        and not drop_and_pad
-    ):
+    if probs is None and not drop_and_pad:
         fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
         if fp32_output is not None:
             return fp32_output
@@ -1409,21 +1386,10 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
-            grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
-        else:
-            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight_fp32 = torch.mm(grad_output.float().t(), inp.float())
-            if hasattr(weight, "_run_torch_gate_fp32_wgrad"):
-                weight._run_torch_gate_fp32_wgrad = grad_weight_fp32
-            grad_weight = grad_weight_fp32.to(ctx.weight_dtype)
+        grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+        grad_weight_fp32 = torch.mm(grad_output.float().t(), inp.float())
+        weight._run_torch_gate_fp32_wgrad = grad_weight_fp32
+        grad_weight = grad_weight_fp32.to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)

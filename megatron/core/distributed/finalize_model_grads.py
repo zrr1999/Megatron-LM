@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
-import os
 from typing import Callable, List, Optional, Union
 
 import torch
@@ -411,10 +410,7 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
-    minimax_loss_normalized_in_graph = (
-        num_tokens is not None
-        and os.environ.get("MINIMAX_LOSS_NORMALIZED_IN_GRAPH", "1") == "1"
-    )
+    minimax_loss_normalized_in_graph = num_tokens is not None
     if minimax_loss_normalized_in_graph:
         # MiniMax alignment: ms-swift's loss_func already divides by local
         # valid-token count inside the autograd graph.  Do not apply MCore's
