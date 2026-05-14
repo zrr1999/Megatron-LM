@@ -59,6 +59,11 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
+def _is_native_torch_optimizer(optimizer):
+    """Return True for native PyTorch optimizers used inside MCore wrappers."""
+    return isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -637,7 +642,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if not HAVE_APEX_OR_TE or _is_native_torch_optimizer(self.optimizer):
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
@@ -669,7 +674,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
-            if not HAVE_APEX_OR_TE:
+            if not HAVE_APEX_OR_TE or _is_native_torch_optimizer(self.optimizer):
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
             elif (
@@ -815,7 +820,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE:
+        if not HAVE_APEX_OR_TE or _is_native_torch_optimizer(self.optimizer):
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)
