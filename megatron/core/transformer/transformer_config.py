@@ -191,6 +191,11 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Use explicit fp32 normalization formulas instead of native norm kernels for alignment."""
 
+    router_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--router-accuracy-compatible"]}}
+    )
+    """Use an explicit fp32 router GEMM instead of the fused Transformer Engine path."""
+
     layernorm_zero_centered_gamma: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
     )
