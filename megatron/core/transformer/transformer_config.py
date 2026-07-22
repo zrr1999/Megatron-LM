@@ -318,6 +318,11 @@ class TransformerConfig(ModelParallelConfig):
     ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
     backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
 
+    dsa_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--dsa-accuracy-compatible"]}}
+    )
+    """Use the full-score DSA fallback with explicit softmax backward for alignment."""
+
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
 
