@@ -20,6 +20,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import AccuracyCompatibleRMSNorm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -107,7 +108,13 @@ def get_dsa_module_spec_for_backend(
     # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
     # with linear projection and have to use unfused qk layernorm.
     qk_norm = (
-        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+        (
+            AccuracyCompatibleRMSNorm
+            if config.norm_accuracy_compatible
+            else backend.layer_norm(rms_norm=rms_norm, for_qk=True)
+        )
+        if config.qk_layernorm
+        else IdentityOp
     )
 
     attention = ModuleSpec(

@@ -24,6 +24,34 @@ class LayerNormBuilder(Protocol):
     ) -> LayerNormInterface: ...
 
 
+class AccuracyCompatibleRMSNorm(torch.nn.Module, LayerNormInterface):
+    """RMSNorm with explicit fp32 reduction and one output cast."""
+
+    def __init__(
+        self,
+        normalized_shape: int | None = None,
+        eps: float = 1e-5,
+        *,
+        hidden_size: int | None = None,
+        config: TransformerConfig | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+        normalized_shape = hidden_size if normalized_shape is None else normalized_shape
+        if normalized_shape is None:
+            raise ValueError("normalized_shape or hidden_size is required")
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        dtype = config.params_dtype if config is not None else None
+        self.weight = torch.nn.Parameter(torch.ones(normalized_shape, dtype=dtype))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_float = x.float()
+        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+        output = x_float * torch.rsqrt(variance + self.eps)
+        return (output * self.weight.float()).to(x.dtype)
+
+
 class WrappedTorchNorm:
     """
     A conditional wrapper to initialize an instance of PyTorch's
@@ -56,6 +84,8 @@ class WrappedTorchNorm:
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
+            if config.norm_accuracy_compatible:
+                return AccuracyCompatibleRMSNorm(normalized_shape=hidden_size, eps=eps)
             assert is_torch_min_version(
                 "2.4.0a0"
             ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
