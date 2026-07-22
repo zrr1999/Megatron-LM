@@ -186,6 +186,11 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Epsilon value for any LayerNorm/RMSNorm operations."""
 
+    norm_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--norm-accuracy-compatible"]}}
+    )
+    """Use explicit fp32 normalization formulas instead of native norm kernels for alignment."""
+
     layernorm_zero_centered_gamma: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
     )
