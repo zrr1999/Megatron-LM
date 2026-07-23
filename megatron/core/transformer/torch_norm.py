@@ -24,6 +24,27 @@ class LayerNormBuilder(Protocol):
     ) -> LayerNormInterface: ...
 
 
+class _AccuracyCompatibleRMSNormFunction(torch.autograd.Function):
+    """RMSNorm core with a stable fp32 backward and canonical zero gradients."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, eps: float) -> torch.Tensor:
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        inv_rms = torch.rsqrt(variance + eps)
+        ctx.save_for_backward(x, inv_rms)
+        return x * inv_rms
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, inv_rms = ctx.saved_tensors
+        dot = (grad_output * x).sum(dim=-1, keepdim=True)
+        correction_scale = dot * (-0.5) * inv_rms.pow(3) / x.shape[-1]
+        correction = (correction_scale * x) * 2.0
+        grad_input = grad_output * inv_rms + correction
+        grad_input = torch.where(grad_input == 0, torch.zeros_like(grad_input), grad_input)
+        return grad_input, None
+
+
 class AccuracyCompatibleRMSNorm(torch.nn.Module, LayerNormInterface):
     """RMSNorm with explicit fp32 reduction and one output cast."""
 
@@ -47,8 +68,7 @@ class AccuracyCompatibleRMSNorm(torch.nn.Module, LayerNormInterface):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_float = x.float()
-        variance = x_float.pow(2).mean(dim=-1, keepdim=True)
-        output = x_float * torch.rsqrt(variance + self.eps)
+        output = _AccuracyCompatibleRMSNormFunction.apply(x_float, self.eps)
         return (output * self.weight.float()).to(x.dtype)
 
 
