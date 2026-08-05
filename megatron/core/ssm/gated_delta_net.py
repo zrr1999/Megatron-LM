@@ -641,9 +641,9 @@ class GatedDeltaNet(MegatronModule):
             if name == "conv1d":
                 # Add TP sharding for Conv1d
                 module_sd = module.state_dict(prefix="", keep_vars=True)
-                tp_sharding_map = {f"weight": 0}
+                tp_sharding_map = {"weight": 0}
                 if self.conv_bias:
-                    tp_sharding_map[f"bias"] = 0
+                    tp_sharding_map["bias"] = 0
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
                     module_sd,
                     f"{prefix}{name}.",

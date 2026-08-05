@@ -3,7 +3,7 @@
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -66,14 +66,16 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    fused_in_proj = backend.column_parallel_layer_norm_linear()
+    fuse_input_layernorm = backend.fuse_layernorm_and_linear() and fused_in_proj is not None
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
+            in_proj=fused_in_proj if fuse_input_layernorm else backend.column_parallel_linear(),
             out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
-        metainfo={"fuse_input_layernorm": True},
+        metainfo={"fuse_input_layernorm": fuse_input_layernorm},
     )
     return attention
 
@@ -437,11 +439,15 @@ def get_linear_attention_pattern(config: TransformerConfig) -> List[int]:
 
 
 def _get_backend_spec_provider(config: TransformerConfig) -> BackendSpecProvider:
-    """Get backend spec provider for experimental attention variant."""
+    """Get backend spec provider for an experimental attention variant."""
+
+    if config.transformer_impl == "local":
+        assert not config.use_kitchen, "Kitchen is not supported with the local transformer implementation."
+        return LocalSpecProvider()
 
     assert config.transformer_impl == "transformer_engine", (
-        "Experimental GPT decoder block spec only supports "
-        "transformer engine implementation for now."
+        "Experimental GPT decoder block spec supports only the local or transformer_engine "
+        f"implementations, got {config.transformer_impl!r}."
     )
     backend: BackendSpecProvider = (
         KitchenSpecProvider(
@@ -471,20 +477,34 @@ def _get_self_attention_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=config.num_moe_experts,
-        moe_grouped_gemm=config.moe_grouped_gemm,
-        qk_layernorm=config.qk_layernorm,
-        multi_latent_attention=config.multi_latent_attention,
-        qk_l2_norm=config.qk_l2_norm,
-        use_kitchen=config.use_kitchen,
-        use_te_activation_func=config.use_te_activation_func,
-        use_kitchen_attention=config.use_kitchen_attention,
-        kitchen_attention_backend=config.kitchen_attention_backend,
-        mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_local_spec,
+        get_gpt_layer_with_transformer_engine_spec,
     )
+
+    if config.transformer_impl == "local":
+        layer_spec = get_gpt_layer_local_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            normalization=config.normalization,
+            qk_l2_norm=config.qk_l2_norm,
+            use_kitchen=False,
+        )
+    else:
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=config.num_moe_experts,
+            moe_grouped_gemm=config.moe_grouped_gemm,
+            qk_layernorm=config.qk_layernorm,
+            multi_latent_attention=config.multi_latent_attention,
+            qk_l2_norm=config.qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+            use_te_activation_func=config.use_te_activation_func,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
+            mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+        )
     attn_spec = layer_spec.submodules.self_attention
     if config.multi_latent_attention:
         attn_spec.metainfo["fuse_input_layernorm"] = False

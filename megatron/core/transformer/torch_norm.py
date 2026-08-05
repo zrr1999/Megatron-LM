@@ -24,6 +24,42 @@ class LayerNormBuilder(Protocol):
     ) -> LayerNormInterface: ...
 
 
+class TorchRMSNorm(torch.nn.Module):
+    """Eager RMSNorm with optional 1-centered (zero-centered gamma) weights.
+
+    PyTorch's native ``RMSNorm`` does not support the 1-centered parameterization used by
+    models such as Qwen3.5. Keep the explicit fp32 reduction and multiplication order here
+    so the local, non-TransformerEngine path matches that model's reference implementation.
+    """
+
+    def __init__(self, normalized_shape: int, eps: float, zero_centered_gamma: bool = False):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,)
+        self.eps = eps
+        self.zero_centered_gamma = zero_centered_gamma
+        self.weight = torch.nn.Parameter(torch.empty(normalized_shape))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        if self.zero_centered_gamma:
+            torch.nn.init.zeros_(self.weight)
+        else:
+            torch.nn.init.ones_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        output = x.float()
+        output = output * torch.rsqrt(output.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        weight = 1.0 + self.weight.float() if self.zero_centered_gamma else self.weight.float()
+        return (output * weight).to(dtype=input_dtype)
+
+    def extra_repr(self) -> str:
+        return (
+            f"normalized_shape={self.normalized_shape}, eps={self.eps}, "
+            f"zero_centered_gamma={self.zero_centered_gamma}"
+        )
+
+
 class WrappedTorchNorm:
     """
     A conditional wrapper to initialize an instance of PyTorch's
@@ -41,27 +77,30 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ) -> LayerNormInterface:
-        assert (
-            not config.layernorm_zero_centered_gamma
-        ), f"zero_centered_gamma not supported by torch LayerNorm"
+        assert not config.persist_layer_norm, "persist_layer_norm not supported by torch LayerNorm"
 
-        assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
-
-        assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
+        assert not config.sequence_parallel, "sequence parallel not supported by torch LayerNorm"
 
         assert (
             not config.memory_efficient_layer_norm
-        ), f"memory_efficient_layer_norm not supported by torch LayerNorm"
+        ), "memory_efficient_layer_norm not supported by torch LayerNorm"
 
         if config.normalization == "LayerNorm":
+            assert (
+                not config.layernorm_zero_centered_gamma
+            ), "zero_centered_gamma not supported by torch LayerNorm"
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
             assert is_torch_min_version(
                 "2.4.0a0"
             ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
-
+            if config.layernorm_zero_centered_gamma:
+                return TorchRMSNorm(normalized_shape=hidden_size, eps=eps, zero_centered_gamma=True)
             norm_cls = torch.nn.RMSNorm
         elif config.normalization == "L2Norm":
+            assert (
+                not config.layernorm_zero_centered_gamma
+            ), "zero_centered_gamma not supported by torch L2Norm"
             norm_cls = torch.nn.L2Norm
         else:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")

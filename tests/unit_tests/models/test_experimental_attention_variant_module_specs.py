@@ -653,3 +653,103 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
 
         assert isinstance(result, TransformerBlockSubmodules)
         assert result.layer_specs == [fake_layer_specs[i] for i in expected_ids]
+
+
+class TestLocalExperimentalBackend:
+    def test_gdn_keeps_input_norm_separate_without_fused_linear(self):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_gated_delta_net_module_spec,
+        )
+
+        backend = _make_backend(fuse_layernorm=False)
+        backend.column_parallel_layer_norm_linear.return_value = None
+        spec = get_gated_delta_net_module_spec(_make_config(), backend=backend)
+
+        assert spec.metainfo == {"fuse_input_layernorm": False}
+        assert spec.submodules.in_proj is _FakeColumnParallelLinear
+        assert spec.submodules.out_norm is _FakeLayerNorm
+        assert spec.submodules.out_proj is _FakeRowParallelLinear
+
+    def test_backend_selector_preserves_te_and_adds_local(self):
+        from megatron.core.extensions.transformer_engine_spec_provider import (
+            TESpecProvider,
+        )
+        from megatron.core.models.backends import LocalSpecProvider
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            _get_backend_spec_provider,
+        )
+
+        assert isinstance(_get_backend_spec_provider(_make_config(transformer_impl="local")), LocalSpecProvider)
+        assert isinstance(
+            _get_backend_spec_provider(_make_config(transformer_impl="transformer_engine")), TESpecProvider
+        )
+
+    def test_mixed_gdn_and_full_attention_specs_are_entirely_local(self):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            _get_backend_spec_provider,
+            get_transformer_layer_with_experimental_attention_variant_spec,
+        )
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.tensor_parallel.layers import (
+            ColumnParallelLinear,
+            RowParallelLinear,
+        )
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.dot_product_attention import DotProductAttention
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_query_groups=2,
+            ffn_hidden_size=64,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=16,
+            moe_router_topk=2,
+            moe_layer_freq=1,
+            linear_attention_freq=[1, 0],
+            experimental_attention_variant="gated_delta_net",
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            normalization="RMSNorm",
+            qk_layernorm=True,
+            transformer_impl="local",
+        )
+        backend = _get_backend_spec_provider(config)
+        layers = get_transformer_layer_with_experimental_attention_variant_spec(config, backend=backend)
+
+        gdn_layer, full_layer = layers
+        gdn = gdn_layer.submodules.self_attention
+        full = full_layer.submodules.self_attention
+        assert gdn.module is GatedDeltaNet
+        assert gdn.metainfo == {"fuse_input_layernorm": False}
+        assert gdn_layer.submodules.input_layernorm is WrappedTorchNorm
+        assert gdn.submodules.in_proj is ColumnParallelLinear
+        assert gdn.submodules.out_norm is WrappedTorchNorm
+        assert gdn.submodules.out_proj is RowParallelLinear
+
+        assert full.module is SelfAttention
+        assert full_layer.submodules.input_layernorm is WrappedTorchNorm
+        assert full.submodules.linear_qkv is ColumnParallelLinear
+        assert full.submodules.core_attention is DotProductAttention
+        assert full.submodules.linear_proj is RowParallelLinear
+        assert full.submodules.q_layernorm is WrappedTorchNorm
+        assert full.submodules.k_layernorm is WrappedTorchNorm
+
+        selected = [
+            gdn_layer.submodules.input_layernorm,
+            gdn.submodules.in_proj,
+            gdn.submodules.out_norm,
+            gdn.submodules.out_proj,
+            full_layer.submodules.input_layernorm,
+            full.submodules.linear_qkv,
+            full.submodules.core_attention,
+            full.submodules.linear_proj,
+            full.submodules.q_layernorm,
+            full.submodules.k_layernorm,
+        ]
+        assert all("transformer_engine" not in module.__module__ for module in selected)
