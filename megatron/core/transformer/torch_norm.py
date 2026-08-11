@@ -24,54 +24,6 @@ class LayerNormBuilder(Protocol):
     ) -> LayerNormInterface: ...
 
 
-class _AccuracyCompatibleRMSNormFunction(torch.autograd.Function):
-    """RMSNorm core with a stable fp32 backward and canonical zero gradients."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, eps: float) -> torch.Tensor:
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        inv_rms = torch.rsqrt(variance + eps)
-        ctx.save_for_backward(x, inv_rms)
-        return x * inv_rms
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        x, inv_rms = ctx.saved_tensors
-        dot = (grad_output * x).sum(dim=-1, keepdim=True)
-        correction_scale = dot * (-0.5) * inv_rms.pow(3) / x.shape[-1]
-        correction = (correction_scale * x) * 2.0
-        grad_input = grad_output * inv_rms + correction
-        grad_input = torch.where(grad_input == 0, torch.zeros_like(grad_input), grad_input)
-        return grad_input, None
-
-
-class AccuracyCompatibleRMSNorm(torch.nn.Module, LayerNormInterface):
-    """RMSNorm with explicit fp32 reduction and one output cast."""
-
-    def __init__(
-        self,
-        normalized_shape: int | None = None,
-        eps: float = 1e-5,
-        *,
-        hidden_size: int | None = None,
-        config: TransformerConfig | None = None,
-        **kwargs,
-    ):
-        super().__init__()
-        normalized_shape = hidden_size if normalized_shape is None else normalized_shape
-        if normalized_shape is None:
-            raise ValueError("normalized_shape or hidden_size is required")
-        self.normalized_shape = (normalized_shape,)
-        self.eps = eps
-        dtype = config.params_dtype if config is not None else None
-        self.weight = torch.nn.Parameter(torch.ones(normalized_shape, dtype=dtype))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_float = x.float()
-        output = _AccuracyCompatibleRMSNormFunction.apply(x_float, self.eps)
-        return (output * self.weight.float()).to(x.dtype)
-
-
 class WrappedTorchNorm:
     """
     A conditional wrapper to initialize an instance of PyTorch's
@@ -89,34 +41,41 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ) -> LayerNormInterface:
-        assert (
-            not config.layernorm_zero_centered_gamma
-        ), f"zero_centered_gamma not supported by torch LayerNorm"
+        assert not config.layernorm_zero_centered_gamma, (
+            f"zero_centered_gamma not supported by torch LayerNorm"
+        )
 
-        assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
+        assert not config.persist_layer_norm, (
+            f"persist_layer_norm not supported by torch LayerNorm"
+        )
 
-        assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
-
-        assert (
-            not config.memory_efficient_layer_norm
-        ), f"memory_efficient_layer_norm not supported by torch LayerNorm"
+        assert not config.memory_efficient_layer_norm, (
+            f"memory_efficient_layer_norm not supported by torch LayerNorm"
+        )
 
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
-            if config.norm_accuracy_compatible:
-                return AccuracyCompatibleRMSNorm(normalized_shape=hidden_size, eps=eps)
-            assert is_torch_min_version(
-                "2.4.0a0"
-            ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
+            assert is_torch_min_version("2.4.0a0"), (
+                "Torch RMSNorm requires PyTorch version >= 2.4.0"
+            )
 
             norm_cls = torch.nn.RMSNorm
         elif config.normalization == "L2Norm":
             norm_cls = torch.nn.L2Norm
         else:
-            raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
+            raise Exception(
+                "Only LayerNorm, RMSNorm and L2Norm are currently supported"
+            )
 
-        return norm_cls(normalized_shape=hidden_size, eps=eps)
+        factory_kwargs = {}
+        if config.normalization == "RMSNorm" and config.norm_accuracy_compatible:
+            factory_kwargs["dtype"] = config.params_dtype
+        norm = norm_cls(normalized_shape=hidden_size, eps=eps, **factory_kwargs)
+        if config.sequence_parallel:
+            for parameter in norm.parameters():
+                parameter.sequence_parallel = True
+        return norm
 
 
 class L2Norm(torch.nn.Module, LayerNormInterface):
@@ -149,7 +108,9 @@ class L2Norm(torch.nn.Module, LayerNormInterface):
             torch.Tensor: The L2-normalized tensor.
         """
         x_float = x.float()
-        return (x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
+        return (
+            x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
+        ).type_as(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

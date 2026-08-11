@@ -49,7 +49,9 @@ def _make_backend(fuse_layernorm=True):
     backend.linear.return_value = _FakeLinear
     backend.column_parallel_linear.return_value = _FakeColumnParallelLinear
     backend.row_parallel_linear.return_value = _FakeRowParallelLinear
-    backend.column_parallel_layer_norm_linear.return_value = _FakeLayerNormColumnParallelLinear
+    backend.column_parallel_layer_norm_linear.return_value = (
+        _FakeLayerNormColumnParallelLinear
+    )
     backend.fuse_layernorm_and_linear.return_value = fuse_layernorm
     backend.core_attention.return_value = _FakeCoreAttention
 
@@ -107,7 +109,12 @@ class TestIsLinearAttentionVariant:
 
     @pytest.mark.parametrize(
         "variant, expected",
-        [("gated_delta_net", True), ("dsa", False), (None, False), ("some_unknown_variant", False)],
+        [
+            ("gated_delta_net", True),
+            ("dsa", False),
+            (None, False),
+            ("some_unknown_variant", False),
+        ],
     )
     def test_variants(self, variant, expected):
         """Validate linear-attention variant classification across supported and unsupported names."""
@@ -199,7 +206,9 @@ class TestGetLinearAttentionPattern:
     def test_none_for_non_linear_variant(self):
         """Verify non-linear variants default to all-standard attention when freq is None."""
         cfg = _make_config(
-            num_layers=4, linear_attention_freq=None, experimental_attention_variant="dsa"
+            num_layers=4,
+            linear_attention_freq=None,
+            experimental_attention_variant="dsa",
         )
         assert self._fn(cfg) == [0, 0, 0, 0]
 
@@ -295,7 +304,9 @@ class TestGetDsaModuleSpec:
         )
 
         if cfg is None:
-            cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True)
+            cfg = _make_config(
+                multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True
+            )
         if backend is None:
             backend = _make_backend()
         return get_dsa_module_spec_for_backend(cfg, backend=backend)
@@ -333,7 +344,9 @@ class TestGetDsaModuleSpec:
 
     def test_core_attention_is_dsa(self):
         """Verify MLA core_attention is wrapped with DSAttention."""
-        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAttention,
+        )
 
         spec = self._call()
         core = spec.submodules.core_attention
@@ -341,7 +354,9 @@ class TestGetDsaModuleSpec:
 
     def test_dsa_indexer_structure(self):
         """Verify DSA indexer wiring uses expected backend linear/norm modules."""
-        from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexer,
+        )
 
         spec = self._call()
         indexer = spec.submodules.core_attention.submodules.indexer
@@ -371,8 +386,8 @@ class TestGetDsaModuleSpec:
         backend.layer_norm.assert_any_call(rms_norm=expected_rms, for_qk=True)
 
     def test_accuracy_compatible_qk_rmsnorm(self):
-        """Verify DSA q/kv norms can use the explicit fp32 RMSNorm path."""
-        from megatron.core.transformer.torch_norm import AccuracyCompatibleRMSNorm
+        """Verify DSA q/kv norms can use the native Torch RMSNorm builder."""
+        from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
         backend = _make_backend()
         cfg = _make_config(
@@ -384,28 +399,34 @@ class TestGetDsaModuleSpec:
         )
         spec = self._call(cfg=cfg, backend=backend)
 
-        assert spec.submodules.q_layernorm is AccuracyCompatibleRMSNorm
-        assert spec.submodules.kv_layernorm is AccuracyCompatibleRMSNorm
+        assert spec.submodules.q_layernorm is WrappedTorchNorm
+        assert spec.submodules.kv_layernorm is WrappedTorchNorm
 
     def test_qk_layernorm_disabled(self):
         """Verify q/kv layernorm becomes IdentityOp, skipping backend.layer_norm for qk."""
         backend = _make_backend()
-        cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=False)
+        cfg = _make_config(
+            multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=False
+        )
         spec = self._call(cfg=cfg, backend=backend)
         assert spec.submodules.q_layernorm is IdentityOp
         assert spec.submodules.kv_layernorm is IdentityOp
         # backend.layer_norm is still called for the indexer k_norm (for_qk=True at line 94),
         # but NOT for the outer qk_norm (line 105-107 takes the else branch).
         # Exactly one for_qk=True call should exist (from the indexer, not from qk_norm).
-        qk_calls = [c for c in backend.layer_norm.call_args_list if c.kwargs.get("for_qk")]
-        assert (
-            len(qk_calls) == 1
-        ), f"Expected 1 for_qk=True call (indexer only), got {len(qk_calls)}"
+        qk_calls = [
+            c for c in backend.layer_norm.call_args_list if c.kwargs.get("for_qk")
+        ]
+        assert len(qk_calls) == 1, (
+            f"Expected 1 for_qk=True call (indexer only), got {len(qk_calls)}"
+        )
 
     def test_linear_projections(self):
         """Verify Q/KV projection slots and backend.column_parallel_linear call count."""
         backend = _make_backend()
-        cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True)
+        cfg = _make_config(
+            multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True
+        )
         spec = self._call(cfg=cfg, backend=backend)
         subs = spec.submodules
         assert subs.linear_q_proj == _FakeColumnParallelLinear
@@ -437,14 +458,18 @@ class TestGetExperimentalAttentionVariantModuleSpec:
     def test_dispatches_to_variant_handler(self, variant, target_fn):
         """Verify dispatcher routes each variant name to its corresponding builder function."""
         backend = _make_backend()
-        cfg = _make_config(experimental_attention_variant=variant, normalization="RMSNorm")
+        cfg = _make_config(
+            experimental_attention_variant=variant, normalization="RMSNorm"
+        )
         with patch(f"{self.MODULE}.{target_fn}") as mock_fn:
             mock_fn.return_value = ModuleSpec(module=MagicMock)
             from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
                 get_experimental_attention_variant_module_spec,
             )
 
-            result = get_experimental_attention_variant_module_spec(cfg, backend=backend)
+            result = get_experimental_attention_variant_module_spec(
+                cfg, backend=backend
+            )
             mock_fn.assert_called_once_with(config=cfg, backend=backend)
             assert result is mock_fn.return_value
 
@@ -469,12 +494,15 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
 
     def _make_attention_spec(self, fuse_input_layernorm=True):
         """Construct a mock attention spec with configurable fuse metadata."""
-        return ModuleSpec(module=MagicMock, metainfo={"fuse_input_layernorm": fuse_input_layernorm})
+        return ModuleSpec(
+            module=MagicMock, metainfo={"fuse_input_layernorm": fuse_input_layernorm}
+        )
 
     def _make_mlp_spec(self, fuse_pre_mlp_layernorm=True):
         """Construct a mock MLP spec with configurable fuse metadata."""
         return ModuleSpec(
-            module=MagicMock, metainfo={"fuse_pre_mlp_layernorm": fuse_pre_mlp_layernorm}
+            module=MagicMock,
+            metainfo={"fuse_pre_mlp_layernorm": fuse_pre_mlp_layernorm},
         )
 
     def test_all_experimental_no_moe(self):
@@ -498,7 +526,10 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 f"{self.MODULE}.get_experimental_attention_variant_module_spec",
                 return_value=attn_spec,
             ),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(mlp_spec, True)),
+            patch(
+                f"{self.MODULE}._get_dense_mlp_module_spec",
+                return_value=(mlp_spec, True),
+            ),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend
@@ -534,8 +565,14 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 f"{self.MODULE}.get_experimental_attention_variant_module_spec",
                 return_value=exp_attn_spec,
             ),
-            patch(f"{self.MODULE}._get_self_attention_module_spec", return_value=std_attn_spec),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(mlp_spec, True)),
+            patch(
+                f"{self.MODULE}._get_self_attention_module_spec",
+                return_value=std_attn_spec,
+            ),
+            patch(
+                f"{self.MODULE}._get_dense_mlp_module_spec",
+                return_value=(mlp_spec, True),
+            ),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend
@@ -571,8 +608,13 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
                 f"{self.MODULE}.get_experimental_attention_variant_module_spec",
                 return_value=attn_spec,
             ),
-            patch(f"{self.MODULE}._get_moe_module_spec", return_value=(moe_spec, False)),
-            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(dense_spec, True)),
+            patch(
+                f"{self.MODULE}._get_moe_module_spec", return_value=(moe_spec, False)
+            ),
+            patch(
+                f"{self.MODULE}._get_dense_mlp_module_spec",
+                return_value=(dense_spec, True),
+            ),
         ):
             specs = get_transformer_layer_with_experimental_attention_variant_spec(
                 cfg, backend=backend
@@ -636,7 +678,8 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
         )
         backend = _make_backend()
         fake_layer_specs = [
-            ModuleSpec(module=TransformerLayer, submodules=MagicMock()) for _ in range(num_layers)
+            ModuleSpec(module=TransformerLayer, submodules=MagicMock())
+            for _ in range(num_layers)
         ]
 
         with (
@@ -657,17 +700,25 @@ class TestGetTransformerBlockWithExperimentalAttentionVariantSpec:
                 # Without explicit layout, slicing comes from offset + num_layers_to_build.
                 with (
                     patch(
-                        f"{self.MODULE}.get_transformer_layer_offset", return_value=offset
+                        f"{self.MODULE}.get_transformer_layer_offset",
+                        return_value=offset,
                     ) as mock_offset,
                     patch(
-                        f"{self.MODULE}.get_num_layers_to_build", return_value=num_layers_to_build
+                        f"{self.MODULE}.get_num_layers_to_build",
+                        return_value=num_layers_to_build,
                     ) as mock_num_layers,
                 ):
-                    result = get_transformer_block_with_experimental_attention_variant_spec(
-                        cfg, vp_stage=vp_stage, pp_rank=pp_rank
+                    result = (
+                        get_transformer_block_with_experimental_attention_variant_spec(
+                            cfg, vp_stage=vp_stage, pp_rank=pp_rank
+                        )
                     )
-                mock_offset.assert_called_once_with(cfg, vp_stage=vp_stage, pp_rank=pp_rank)
-                mock_num_layers.assert_called_once_with(cfg, vp_stage=vp_stage, pp_rank=pp_rank)
+                mock_offset.assert_called_once_with(
+                    cfg, vp_stage=vp_stage, pp_rank=pp_rank
+                )
+                mock_num_layers.assert_called_once_with(
+                    cfg, vp_stage=vp_stage, pp_rank=pp_rank
+                )
 
         assert isinstance(result, TransformerBlockSubmodules)
         assert result.layer_specs == [fake_layer_specs[i] for i in expected_ids]
