@@ -20,7 +20,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import AccuracyCompatibleRMSNorm
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -58,6 +58,15 @@ except ImportError:
 ##########
 
 
+def _get_standalone_norm(
+    config: TransformerConfig, backend: BackendSpecProvider, *, for_qk=False
+):
+    rms_norm = config.normalization == "RMSNorm"
+    if rms_norm and config.norm_accuracy_compatible:
+        return WrappedTorchNorm
+    return backend.layer_norm(rms_norm=rms_norm, for_qk=for_qk)
+
+
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -66,12 +75,11 @@ def get_gated_delta_net_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    rms_norm = config.normalization == "RMSNorm"
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+            out_norm=_get_standalone_norm(config, backend),
             out_proj=backend.row_parallel_linear(),
         ),
         metainfo={"fuse_input_layernorm": True},
@@ -83,7 +91,9 @@ def get_dsa_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
     """Helper function to get module spec for Sparse Attention."""
-    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+    assert config.multi_latent_attention, (
+        "Currently only MLA supports sparse attention."
+    )
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
     # Because TransformerEngine does not support sparse attention yet, we use local
@@ -103,16 +113,10 @@ def get_dsa_module_spec_for_backend(
         ),
     )
 
-    # Adjust for RMS norm.
-    rms_norm = config.normalization == "RMSNorm"
     # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
     # with linear projection and have to use unfused qk layernorm.
     qk_norm = (
-        (
-            AccuracyCompatibleRMSNorm
-            if config.norm_accuracy_compatible
-            else backend.layer_norm(rms_norm=rms_norm, for_qk=True)
-        )
+        _get_standalone_norm(config, backend, for_qk=True)
         if config.qk_layernorm
         else IdentityOp
     )
@@ -210,7 +214,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         experimental_attention_spec = None
 
     if 0 in experimental_attention_pattern:
-        standard_attention_spec = _get_self_attention_module_spec(config=config, backend=backend)
+        standard_attention_spec = _get_self_attention_module_spec(
+            config=config, backend=backend
+        )
     else:
         standard_attention_spec = None
 
@@ -235,7 +241,6 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         dense_mlp_layer_spec, fuse_layernorm_pre_dense = None, False
 
     # Get GPT decoder block layer specs
-    rms_norm = config.normalization == "RMSNorm"
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -243,7 +248,11 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
             if experimental_attention_pattern[layer_number] == 1
             else standard_attention_spec
         )
-        mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
+        mlp = (
+            moe_layer_spec
+            if moe_layer_pattern[layer_number] == 1
+            else dense_mlp_layer_spec
+        )
         fuse_pre_mlp_layernorm = (
             fuse_layernorm_pre_moe
             if moe_layer_pattern[layer_number] == 1
@@ -252,12 +261,12 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         input_layernorm = (
             IdentityOp
             if attention.metainfo["fuse_input_layernorm"]
-            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            else _get_standalone_norm(config, backend)
         )
         pre_mlp_layernorm = (
             IdentityOp
             if fuse_pre_mlp_layernorm
-            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            else _get_standalone_norm(config, backend)
         )
 
         layer_specs.append(
@@ -278,7 +287,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
 
 def get_transformer_block_with_experimental_attention_variant_spec(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+    config: TransformerConfig,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """Build transformer block spec with experimental attention variants (e.g., linear attention).
 
@@ -316,17 +327,20 @@ def get_transformer_block_with_experimental_attention_variant_spec(
             layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
         )
     else:
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
-        num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+        offset = get_transformer_layer_offset(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+        num_layers_to_build = get_num_layers_to_build(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
     _validate_dsa_index_share_pipeline_split(config, local_layer_ids)
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
-    rms_norm = config.normalization == "RMSNorm"
     gpt_decoder_block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+        layer_specs=layer_specs, layer_norm=_get_standalone_norm(config, backend)
     )
 
     return gpt_decoder_block_spec
@@ -343,7 +357,9 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     return experimental_attention_variant in linear_attention_variants
 
 
-def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
+def _validate_dsa_index_share_pipeline_split(
+    config: TransformerConfig, local_layer_ids
+) -> None:
     """Ensure DSA top-k sharing does not require top-k indices from another PP stage."""
     if (
         config.experimental_attention_variant != "dsa"
@@ -358,12 +374,16 @@ def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_la
     for position, layer_id in enumerate(local_layer_ids):
         layer_number = layer_id + 1
         if not is_dsa_skip_topk_layer(
-            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+            layer_number,
+            config.dsa_indexer_skip_topk_offset,
+            config.dsa_indexer_topk_freq,
         ):
             continue
 
         source_layer_number = source_dsa_compute_layer(
-            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+            layer_number,
+            config.dsa_indexer_skip_topk_offset,
+            config.dsa_indexer_topk_freq,
         )
         source_layer_id = source_layer_number - 1
         if (
@@ -390,7 +410,8 @@ def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
     if isinstance(config.moe_layer_freq, int):
         # [1,0,0,...,0,1,0,0,...,0,...]
         moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
+            1 if (i % config.moe_layer_freq == 0) else 0
+            for i in range(config.num_layers)
         ]
     elif isinstance(config.moe_layer_freq, list):
         moe_layer_pattern = config.moe_layer_freq
@@ -478,7 +499,9 @@ def _get_self_attention_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_spec,
+    )
 
     layer_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=config.num_moe_experts,
@@ -539,7 +562,9 @@ def _get_moe_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+    from megatron.core.models.gpt.moe_module_specs import (
+        get_moe_module_spec_for_backend,
+    )
 
     return (
         get_moe_module_spec_for_backend(
