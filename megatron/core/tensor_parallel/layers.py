@@ -57,6 +57,8 @@ try:
 except ImportError:
     HAVE_TE = False
 
+from megatron.core.transformer.module import _use_accuracy_compatible
+
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
@@ -235,7 +237,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode
+        self.deterministic_mode = config.deterministic_mode or _use_accuracy_compatible()
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (

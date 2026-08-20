@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
+from megatron.core.transformer.module import _use_accuracy_compatible
 from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
@@ -24,6 +25,18 @@ def swiglu(y):
     """
     y_1, y_2 = torch.chunk(y, 2, -1)
     return F.silu(y_1) * y_2
+
+
+def swiglu_eager(y):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return F.silu(y_1) * y_2
+
+
+def swiglu_back_eager(g, y):
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return torch.cat(
+        (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
+    )
 
 
 @jit_fuser
@@ -97,6 +110,15 @@ def weighted_swiglu_back(g, y, weights):
     return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
+def weighted_swiglu_back_eager(g, y, weights):
+    input_dtype = y.dtype
+    w_dtype = weights.dtype
+    input_grad = swiglu_back_eager(g * weights, y)
+    weights_grad = swiglu_eager(y) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
+
+
 class BiasSwiGLUFunction(torch.autograd.Function):
     """Custom autograd function for SwiGLU activation with bias support."""
 
@@ -121,6 +143,8 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
+        if _use_accuracy_compatible():
+            return swiglu_eager(input + bias)
         return bias_swiglu(input, bias)
 
     @staticmethod
@@ -140,7 +164,11 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = bias_swiglu_back(grad_output, input, bias)
+        if _use_accuracy_compatible():
+            y = input + bias
+            tmp = swiglu_back_eager(grad_output, y)
+        else:
+            tmp = bias_swiglu_back(grad_output, input, bias)
         return tmp, tmp, None, None
 
 
@@ -166,6 +194,8 @@ class SwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
+        if _use_accuracy_compatible():
+            return swiglu_eager(input)
         return swiglu(input)
 
     @staticmethod
@@ -184,7 +214,12 @@ class SwiGLUFunction(torch.autograd.Function):
         """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp = swiglu_back(grad_output, input)
+        if _use_accuracy_compatible():
+            if not hasattr(SwiGLUFunction, '_bwd_logged'):
+                SwiGLUFunction._bwd_logged = True
+            tmp = swiglu_back_eager(grad_output, input)
+        else:
+            tmp = swiglu_back(grad_output, input)
         return tmp, None, None
 
 
@@ -196,13 +231,20 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
+        if _use_accuracy_compatible():
+            dtype = input.dtype
+            res = swiglu_eager(input) * weights
+            return res.to(dtype)
         return weighted_swiglu(input, weights)
 
     @staticmethod
     def backward(ctx, grad_output):
         input, weights = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
+        if _use_accuracy_compatible():
+            tmp, wgrad = weighted_swiglu_back_eager(grad_output, input, weights)
+        else:
+            tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None
 
 

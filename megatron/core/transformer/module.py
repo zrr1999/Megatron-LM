@@ -22,6 +22,51 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
+def _iter_modules_with_expert_bias(module):
+    if module is None:
+        return
+    for submodule in module.modules():
+        expert_bias = getattr(submodule, 'expert_bias', None)
+        if expert_bias is not None:
+            yield submodule, expert_bias
+
+
+def _snapshot_expert_bias_fp32(module):
+    snapshots = {}
+    for submodule, expert_bias in _iter_modules_with_expert_bias(module):
+        snapshot = expert_bias.detach().clone().to(
+            device=expert_bias.device,
+            dtype=torch.float32,
+        )
+        snapshots[submodule] = snapshot
+        submodule._run_torch_master_expert_bias_fp32 = snapshot
+    return snapshots
+
+
+def _restore_expert_bias_fp32(module, snapshots):
+    restored = 0
+    for submodule, expert_bias in _iter_modules_with_expert_bias(module):
+        snapshot = snapshots.get(submodule)
+        if snapshot is None:
+            snapshot = getattr(submodule, '_run_torch_master_expert_bias_fp32', None)
+        if snapshot is None:
+            continue
+        expert_bias.data = snapshot.to(device=expert_bias.device, dtype=snapshot.dtype)
+        restored += 1
+    return restored
+
+
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    import os
+
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
 
@@ -442,6 +487,11 @@ class Float16Module(MegatronModule):
         self.vp_stage = getattr(module, 'vp_stage', None)
         self.pg_collection = getattr(module, 'pg_collection', None)
 
+        expert_bias_snapshots = {}
+        _accuracy_compatible = _use_accuracy_compatible()
+        if _accuracy_compatible and (self.fp16 or self.bf16):
+            expert_bias_snapshots = _snapshot_expert_bias_fp32(module)
+
         if self.fp16:
             self.add_module('module', module.half())
 
@@ -456,6 +506,12 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        if expert_bias_snapshots:
+            _restore_expert_bias_fp32(self.module, expert_bias_snapshots)
+
+        if _accuracy_compatible and getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0:
+            config.moe_router_bias_update_rate = 0.0
 
         self.float16_convertor = float16_convertor
 

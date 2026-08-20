@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -51,6 +52,72 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
+def _fp32_accum_unpermute(
+    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape
+):
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 把 permuted_tokens 提升到 fp32 后用 scatter_add_ 累加，再 cast 回原 dtype，
+    # 单次 round，复刻 PF 侧确定性 fp32 累加路径。
+    if len(restore_shape) != 2:
+        return None
+
+    hidden = int(restore_shape[-1])
+    output_tokens = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
+    output_tokens.scatter_add_(
+        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens.to(torch.float32)
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
+
+
+class _Fp32BackwardIndexSelect(torch.autograd.Function):
+    """permute 阶段 `index_select` 的 fp32 反向累积实现。
+
+    forward 与原生 `tokens.index_select(0, sorted_indices)` 完全一致。
+    backward 时，多个 permuted 行会回写到同一个原始 token 行（一个 token 被
+    topk 个 expert 选中），原生 index_select 的 backward 走 bf16 `index_add`/
+    `scatter_add`，atomic 累加顺序不可复现，与 PaddleFleet 末位 diff。
+    这里把 grad 提升到 fp32 后 scatter_add 累加，再 cast 回原 dtype，单次 round，
+    复刻 PF 侧确定性 fp32 累加路径。
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, sorted_indices):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = tokens.shape[0]
+        ctx.hidden = tokens.shape[1]
+        ctx.input_dtype = tokens.dtype
+        return tokens.index_select(0, sorted_indices)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (sorted_indices,) = ctx.saved_tensors
+        grad_tokens = torch.zeros(
+            (ctx.num_tokens, ctx.hidden), dtype=torch.float32, device=grad_output.device
+        )
+        grad_tokens.scatter_add_(
+            0, sorted_indices.unsqueeze(1).expand(-1, ctx.hidden), grad_output.to(torch.float32)
+        )
+        return grad_tokens.to(dtype=ctx.input_dtype), None
+
+
+def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tensor):
+    return _Fp32BackwardIndexSelect.apply(tokens, sorted_indices)
+
+
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 
 def switch_load_balancing_loss_func(
@@ -424,7 +491,11 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    if _use_accuracy_compatible() and not drop_and_pad:
+        # fp32 确定性反向累积，复刻 PF 侧 permute backward
+        permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
@@ -483,6 +554,15 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 在 unpermute（无 probs、非 drop_and_pad）的标准路径上改走 fp32 累加。
+    # 由 use_accuracy_compatible 控制，关闭时保留原始 scatter_add_ 路径。
+    if _use_accuracy_compatible() and probs is None and not drop_and_pad:
+        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        if fp32_output is not None:
+            return fp32_output
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -798,17 +878,33 @@ def topk_routing_with_score_function(
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
-        if score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float())
+        if _use_accuracy_compatible():
+            if score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float()).type_as(logits)
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+            if expert_bias is not None:
+                scores_for_routing = scores + expert_bias
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+                scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            else:
+                scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            _scores_f64 = scores.double()
+            _sum_f64 = _scores_f64.sum(dim=-1, keepdim=True)
+            _denom = _sum_f64.float() + 1e-20
+            probs = scores / _denom if topk > 1 else scores
         else:
-            scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
-            scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices)
-        else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+            if score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float())
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt()
+            if expert_bias is not None:
+                scores_for_routing = scores + expert_bias.float()
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+                scores = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -1266,7 +1362,15 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        # 禁用 router TE GEMM，强制走 torch.mm 以对齐 PaddleFleet。
+        # te_general_gemm 在 fp32 router_dtype 下与 PF 的 matmul 选不同 cuBLAS 算法，
+        # 导致 gate_logits 末位 diff，叠加 topk 离散选择后 router_output_0/1 翻转。
+        # 由 use_accuracy_compatible 控制：关闭时保留原始 TE GEMM 路径。
+        if (
+            not _use_accuracy_compatible()
+            and te_general_gemm is not None
+            and router_dtype != torch.float64
+        ):
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1299,7 +1403,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        # 禁用 TE GEMM 以对齐 PF 精度
+        # 由 use_accuracy_compatible 控制：关闭时保留原始 TE GEMM 路径。
+        if (
+            not _use_accuracy_compatible()
+            and te_general_gemm is not None
+            and ctx.router_dtype != torch.float64
+        ):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )

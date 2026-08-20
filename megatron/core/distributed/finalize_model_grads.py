@@ -3,6 +3,7 @@
 from functools import partial
 from typing import Callable, Dict, List, Optional, Union
 
+import os
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -459,6 +460,17 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    
+    # [对齐修复] use_accuracy_compatible=1: PaddleFleet 的 fixed-loss 路径已在 autograd 图内除过
+    # 本地有效 token 数, MCore 这里再用全局 num_tokens 缩放会引入 ~global_token / local_token
+    # 倍的额外因子 (实测 ~74.64x)。在对齐模式下跳过 num_tokens 全局缩放, 改为 grad sync 后做
+    # 1/dp_size 平均, 与 Paddle DP 平均语义对齐; 同时对 RouterGatingLinearFunction 记录的
+    # fp32 gate wgrad 做一次 DP all-reduce, 与参考实现一致。
+    from ..transformer.module import _use_accuracy_compatible
+    loss_normalized_in_graph = _use_accuracy_compatible() and (num_tokens is not None)
+    if loss_normalized_in_graph:
+        num_tokens = None
+    
     tp_dp_cp_group = None
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
@@ -536,6 +548,13 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
+
+        # [对齐修复] use_accuracy_compatible=1 时冻结 expert_bias 更新,
+        # 因为 PaddleFormers 尚未实现该 buffer 的 step 间更新逻辑,
+        # 保留前向加 bias 但跳过 all_reduce + update 保证 step2 前向对齐。
+        if not _use_accuracy_compatible():
+            _update_router_expert_bias(model, config)
+
         if pg_collection is None:
             tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
                 with_context_parallel=True
@@ -543,6 +562,22 @@ def finalize_model_grads(
         _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
+
+    # [对齐修复] 对应上方 loss_normalized_in_graph 早跳过分支: 跳过全局 num_tokens 缩放后,
+    # 这里改为 grad sync 后做 1/dp_size 平均, 与 PaddleFleet DP 平均语义对齐;
+    # 并对 RouterGatingLinearFunction 记录到 param._run_torch_gate_fp32_wgrad 的 fp32 gate
+    # wgrad 做一次 DP all-reduce (若该机制未启用则 getattr 为 None, 代码为 no-op)。
+    if loss_normalized_in_graph:
+        dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        if dp_size > 1:
+            for model_chunk in model:
+                model_chunk.scale_gradients(1.0 / dp_size)
+
+        for model_chunk in model:
+            for param in model_chunk.parameters():
+                gate_wgrad = getattr(param, "_run_torch_gate_fp32_wgrad", None)
+                if gate_wgrad is not None:
+                    torch.distributed.all_reduce(gate_wgrad, group=dp_cp_group)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

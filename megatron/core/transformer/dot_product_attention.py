@@ -13,7 +13,7 @@ from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     attention_mask_func,
@@ -21,6 +21,38 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
 )
 from megatron.core.utils import divide
+
+
+class _QKScoresFn(torch.autograd.Function):
+    """Q*K^T with contiguous operands and explicitly laid out backward GEMMs.
+
+    [对齐修复] cuBLAS picks its kernel based on operand leading dimensions, so feeding
+    strided views to ``baddbmm`` (and letting autograd feed strided views to the backward
+    GEMMs) makes the result depend on the GPU architecture (H800 and H20 diverge for odd
+    sq in 65..95). Materializing the operands mirrors PaddleFleet's ``_EagerQKScoresFn``
+    and keeps the numerics reproducible. Only used when ``_use_accuracy_compatible()``.
+    """
+
+    @staticmethod
+    def forward(ctx, query, key_t, scale):
+        matmul_input_buffer = torch.empty(
+            (query.shape[0], query.shape[1], key_t.shape[2]),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        scores = torch.baddbmm(matmul_input_buffer, query, key_t, beta=0.0, alpha=scale)
+        ctx.save_for_backward(query, key_t)
+        ctx.scale = scale
+        return scores
+
+    @staticmethod
+    def backward(ctx, d_scores):
+        query, key_t = ctx.saved_tensors
+        scale = ctx.scale
+        key = key_t.transpose(1, 2).contiguous()
+        d_query = torch.bmm(d_scores, key) * scale
+        d_key_t = torch.bmm(query.transpose(1, 2), d_scores) * scale
+        return d_query, d_key_t, None
 
 
 class DotProductAttention(MegatronModule):
@@ -185,19 +217,27 @@ class DotProductAttention(MegatronModule):
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
-        )
-
         # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_input_buffer,
-            query.transpose(0, 1),  # [b * np, sq, hn]
-            key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0,
-            alpha=self.softmax_scale,
-        )
+        if _use_accuracy_compatible():
+            matmul_result = _QKScoresFn.apply(
+                query.transpose(0, 1).contiguous(),  # [b * np, sq, hn]
+                key.transpose(0, 1).transpose(1, 2).contiguous(),  # [b * np, hn, sk]
+                self.softmax_scale,
+            )
+        else:
+            # preallocting input tensor: [b * np, sq, sk]
+            matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]),
+                query.dtype,
+                "mpu",
+            )
+            matmul_result = torch.baddbmm(
+                matmul_input_buffer,
+                query.transpose(0, 1),  # [b * np, sq, hn]
+                key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0,
+                alpha=self.softmax_scale,
+            )
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)

@@ -1162,6 +1162,38 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
 
 
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    import os
+
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
+class _SeqMLPProxy:
+    """Expose GroupedMLP-compatible ``weight{i}`` / ``bias{i}`` access on top of
+    ``SequentialMLP.local_experts[i].linear_fc{1,2}``.
+
+    Required by upper layers (e.g. ms-swift's ``GPTBridge._set_mlp_state``) that
+    probe ``mg_mlp.linear_fc1`` / ``linear_fc2`` like GroupedMLP.
+    """
+    def __init__(self, experts, attr):
+        self._experts = experts
+        self._attr = attr
+
+    def __getattr__(self, name):
+        if name.startswith('weight'):
+            idx = int(name[len('weight'):])
+            return getattr(self._experts[idx], self._attr).weight
+        if name.startswith('bias'):
+            idx = int(name[len('bias'):])
+            return getattr(self._experts[idx], self._attr).bias
+        raise AttributeError(name)
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
@@ -1205,6 +1237,62 @@ class SequentialMLP(MegatronModule):
                 name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
+
+        # ---- alignment patch: expose GroupedMLP-style interfaces on SequentialMLP ----
+        # Upper layers (e.g. ms-swift gpt_bridge._set_mlp_state) probe
+        # `mg_mlp.linear_fc1` / `linear_fc2` and expect `weight{i}`/`bias{i}` access
+        # like GroupedMLP. Inject a thin proxy that forwards to local_experts[i].
+        # Gated by use_accuracy_compatible; otherwise SequentialMLP keeps its original
+        # interface (no linear_fc1/linear_fc2 attributes).
+        if _use_accuracy_compatible():
+            self.linear_fc1 = _SeqMLPProxy(self.local_experts, 'linear_fc1')
+            self.linear_fc2 = _SeqMLPProxy(self.local_experts, 'linear_fc2')
+            self._register_expert_fp32_wgrad_hooks()
+
+    def _register_expert_fp32_wgrad_hooks(self):
+        """[对齐修复][expert wgrad 使用 fp32 计算]
+        为每个 expert 的 linear_fc1 / linear_fc2 注册 hook，旁路捕获 **fp32** 权重梯度到
+        weight._run_torch_expert_fp32_wgrad；DDP 累加 hook 会用它 copy_ 进 fp32 main_grad，
+        替换 autograd 的 bf16 wgrad，对齐 PaddleFleet 的 fp32 expert wgrad。
+
+        仅记录、不改前向数值（前向已逐位对齐，不能动）。wgrad = grad_out.float().T @ input.float()，
+        与 autograd 的 wgrad = grad_out.T @ input 数学等价，只是全程 fp32 单次 round。
+        """
+
+        def _make_forward_hook(lin_module):
+            def _forward_hook(module, inputs, output):
+                inp = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+                out = output[0] if isinstance(output, (tuple, list)) else output
+                if inp is None or out is None or not getattr(out, 'requires_grad', False):
+                    return
+                weight = getattr(module, 'weight', None)
+                if weight is None:
+                    return
+                saved_inp = inp.detach()
+
+                def _grad_hook(grad, _w=weight, _i=saved_inp):
+                    if grad is None or _i.shape[0] == 0:
+                        return grad
+                    with torch.no_grad():
+                        wg = torch.matmul(
+                            grad.detach().to(torch.float32).transpose(0, 1),
+                            _i.to(torch.float32),
+                        )
+                        prev = getattr(_w, '_run_torch_expert_fp32_wgrad', None)
+                        if prev is None:
+                            _w._run_torch_expert_fp32_wgrad = wg
+                        else:
+                            prev.add_(wg)
+                    return grad
+
+                out.register_hook(_grad_hook)
+
+            return _forward_hook
+
+        for expert in self.local_experts:
+            for lin in (expert.linear_fc1, expert.linear_fc2):
+                lin.register_forward_hook(_make_forward_hook(lin))
+
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""

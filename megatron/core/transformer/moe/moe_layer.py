@@ -12,7 +12,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -642,9 +642,29 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
                 if "route" in self.fwd_execution_map:
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    # Bit-exact mode keeps router/dispatcher/shared on independent
+                    # identity nodes. This is part of the numerical graph, not a
+                    # logging probe: removing the nodes changes bf16 gradient sum
+                    # order at the shared input, and makes the router input grad a
+                    # 3-way accumulated value that PF's ThreePathCloneAlignMG splits.
+                    if _use_accuracy_compatible() and hidden_states.requires_grad:
+                        _hs_router_path_mg = hidden_states.clone()
+                        _hs_dispatcher_path_mg = hidden_states.clone()
+                        _hs_shared_path_mg = hidden_states.clone()
+
+                        hidden_states_shared = _hs_shared_path_mg
+                        hidden_states_router = _hs_router_path_mg
+                        hidden_states_dispatch = _hs_dispatcher_path_mg
+                    else:
+                        hidden_states_shared = hidden_states
+                        hidden_states_router = hidden_states
+                        hidden_states_dispatch = hidden_states
+
+                    shared_expert_output = self.shared_experts_compute(hidden_states_shared)
+                    probs, routing_map = self.route(hidden_states_router, padding_mask)
+                    hidden_states, probs = self.preprocess(
+                        hidden_states_dispatch, probs, routing_map
+                    )
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
