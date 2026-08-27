@@ -99,6 +99,14 @@ class BackendSpecProvider(Protocol):
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
 
+    def linear(self) -> type:
+        """TP-replicated Linear (mcore TELinear parallel_mode=duplicated).
+
+        DSA indexer / MLA down-projections call backend.linear(). Without this
+        method, mcore_bridge can only build those layers via TESpecProvider.
+        """
+        return TELinear
+
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
         return ColumnParallelLinear
