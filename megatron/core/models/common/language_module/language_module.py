@@ -222,6 +222,22 @@ class LanguageModule(MegatronModule):
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
+
+        if _use_accuracy_compatible():
+            # 精度对齐锚点 1（对应 PF language_loss.py forward_impl 里的 per_token_loss）：
+            # CE 直出、mask/归一化前的 per-token loss，两侧语义唯一。
+            # 注意：CP > 1 时这里仍是本 rank 的 sequence shard，需与 PF 侧
+            # ContextParallelGatherOp 之后的全量 shape 区分。
+            import hashlib as _hashlib
+
+            _l = loss.detach().float().contiguous()
+            print(
+                f"\nper_token_loss: rank={torch.distributed.get_rank()} "
+                f"shape={list(_l.shape)} "
+                f"md5={_hashlib.md5(_l.cpu().numpy().tobytes()).hexdigest()}",
+                flush=True,
+            )
+
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:
