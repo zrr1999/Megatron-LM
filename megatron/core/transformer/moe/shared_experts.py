@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 import warnings
 from copy import deepcopy
 from enum import Enum
@@ -188,6 +189,24 @@ class SharedExpertMLP(MLP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
+        # E-456: gated one-shot dump of shared-expert fc1 X. Off unless
+        # MODEL_REPRO_MTP_SHARED_SWIGLU_DUMP=1. No register_hook.
+        _swiglu_dump = os.environ.get("MODEL_REPRO_MTP_SHARED_SWIGLU_DUMP") == "1"
+        _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _swiglu_dump and _live:
+            import torch.distributed as _td
+
+            _rk = _td.get_rank() if _td.is_initialized() else 0
+            _name = str(getattr(self, "layer_number", getattr(self, "name", "sh")))
+            _key = f"fwd_{_name}_{_rk}"
+            if not getattr(type(self), "_e456_dumped", None):
+                type(self)._e456_dumped = set()
+            if _key not in type(self)._e456_dumped:
+                type(self)._e456_dumped.add(_key)
+                os.makedirs(_live, exist_ok=True)
+                hidden_states.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_mtpsh_fc1x_l{_name}_r{_rk}.f32.bin")
+                )
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)

@@ -11,8 +11,103 @@ from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import hashlib
+import json
+import os
+
 import torch
 from typing_extensions import override
+
+
+def _dump_post_optimizer_params(optimizer) -> None:
+    """Dump-only post-step bf16 param hashes. Observation, not a wrap."""
+    print(
+        f"[POST-OPT-PARAM] torch enter type={type(optimizer).__name__} "
+        f"dir={os.environ.get('MODEL_REPRO_POST_OPT_PARAM_DIR')} "
+        f"step={os.environ.get('MODEL_REPRO_STEP')}",
+        flush=True,
+    )
+    output_dir = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_DIR")
+    if not output_dir:
+        print("[POST-OPT-PARAM] torch skip: no MODEL_REPRO_POST_OPT_PARAM_DIR", flush=True)
+        return
+    step = int(os.environ.get("MODEL_REPRO_STEP", "1"))
+    want = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_STEPS", "1")
+    # Swift sets MODEL_REPRO_STEP to the 0-based iteration before optimizer.step.
+    # Accept both "0" and "1" as the first update.
+    allowed = {piece.strip() for piece in want.split(",") if piece.strip()}
+    if allowed and str(step) not in allowed and not (step == 0 and "1" in allowed):
+        print(f"[POST-OPT-PARAM] torch skip: step={step} want={want}", flush=True)
+        return
+    dump_step = 1 if step == 0 else step
+    needles_raw = os.environ.get(
+        "MODEL_REPRO_POST_OPT_PARAM_MATCH",
+        "enorm,hnorm,router,shared_experts,linear_fc1,linear_fc2,word_embeddings",
+    )
+    needles = [piece.strip() for piece in needles_raw.split(",") if piece.strip()]
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    parameters = []
+    models = []
+    if getattr(optimizer, "model_chunks", None):
+        models = list(optimizer.model_chunks)
+    elif getattr(optimizer, "chained_optimizers", None):
+        for inner in optimizer.chained_optimizers:
+            models.extend(getattr(inner, "model_chunks", []) or [])
+            groups = getattr(inner, "float16_groups", None)
+            if groups:
+                for group_index, group in enumerate(groups):
+                    for param_index, param in enumerate(group):
+                        models.append(("float16", group_index, param_index, param))
+    named = []
+    for chunk_index, model in enumerate(models):
+        if isinstance(model, tuple) and model and model[0] == "float16":
+            _, group_index, param_index, param = model
+            named.append((f"g{group_index}p{param_index}", param))
+            continue
+        if hasattr(model, "named_parameters"):
+            for name, param in model.named_parameters():
+                named.append((name, param))
+    if not named:
+        print(
+            f"[POST-OPT-PARAM] torch empty named params type={type(optimizer).__name__} "
+            f"chunks={len(getattr(optimizer, 'model_chunks', []) or [])} "
+            f"chained={len(getattr(optimizer, 'chained_optimizers', []) or [])}",
+            flush=True,
+        )
+        return
+    for name, param in named:
+        if needles and not any(needle in name for needle in needles):
+            continue
+        tensor = param.detach().contiguous().to(device="cpu")
+        digest = hashlib.sha256(
+            tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
+        record = {
+            "name": name,
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "numel": int(tensor.numel()),
+            "sha256": digest,
+        }
+        if tensor.ndim == 2:
+            record["transpose_sha256"] = hashlib.sha256(
+                tensor.transpose(0, 1).contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+        parameters.append(record)
+    payload = {
+        "schema": "glm52-post-optimizer-param-inventory/v1",
+        "framework": "torch",
+        "rank": rank,
+        "step": dump_step,
+        "parameters": parameters,
+        "parameter_count": len(parameters),
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"rank{rank}_step{dump_step}.json")
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    print(f"[POST-OPT-PARAM] torch rank={rank} step={dump_step} n={len(parameters)}", flush=True)
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
@@ -771,6 +866,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros').stop()
 
         success = self.step_with_ready_grads()
+
+        if success:
+            _dump_post_optimizer_params(self)
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
@@ -1737,6 +1835,9 @@ class ChainedOptimizer(MegatronOptimizer):
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         update_successful = False if should_skip_update else self.step_with_ready_grads()
+
+        if update_successful:
+            _dump_post_optimizer_params(self)
 
         return update_successful, grad_norm, num_zeros_in_grad
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -334,6 +335,28 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
 
         nvtx_range_pop(suffix="activation")
+        # After every activation path (fused or eager). YAML has
+        # bias_activation_fusion=False, so the dump must not sit inside
+        # bias_swiglu_impl.
+        if (
+            os.environ.get("MODEL_REPRO_MTP_SHARED_SWIGLU_DUMP") == "1"
+            and os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+            and type(self).__name__ == "SharedExpertMLP"
+        ):
+            import torch.distributed as _td3
+
+            _rk3 = _td3.get_rank() if _td3.is_initialized() else 0
+            _li3 = str(getattr(self, "layer_number", getattr(self, "name", "sh")))
+            _live3 = os.environ["MODEL_REPRO_LIVE_XY_DUMP_DIR"]
+            _sk = f"act_{_li3}_{_rk3}"
+            if not getattr(type(self), "_e456_act", None):
+                type(self)._e456_act = set()
+            if _sk not in type(self)._e456_act:
+                type(self)._e456_act.add(_sk)
+                os.makedirs(_live3, exist_ok=True)
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live3, f"torch_mtpsh_act_l{_li3}_r{_rk3}.f32.bin")
+                )
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
