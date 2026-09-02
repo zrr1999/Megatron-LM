@@ -64,7 +64,10 @@ def _use_accuracy_compatible() -> bool:
 
 
 def _fp32_accum_unpermute(
-    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape,
+    routing_map: Optional[torch.Tensor] = None,
 ):
     # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
     # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
@@ -72,6 +75,56 @@ def _fp32_accum_unpermute(
     # 单次 round，复刻 PF 侧确定性 fp32 累加路径。
     if len(restore_shape) != 2:
         return None
+
+    if os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+        hidden = int(restore_shape[-1])
+        if hidden != permuted_tokens.shape[-1]:
+            return None
+        num_tokens = int(restore_shape[0])
+        R = sorted_indices.shape[0]
+        if os.environ.get("MODEL_REPRO_MOE_UNPERM_VERBOSE", "0") == "1":
+            import torch.distributed as _dv
+
+            _rk2 = _dv.get_rank() if _dv.is_initialized() else 0
+            print(
+                f"[UNPERM-T] r{_rk2} restore={restore_shape} R={R} num_tokens={num_tokens} "
+                f"si min={int(sorted_indices.min())} max={int(sorted_indices.max())} "
+                f"perm={tuple(permuted_tokens.shape)}",
+                flush=True,
+            )
+        if routing_map is None:
+            return None
+        # E-170: replicate PaddleFleet's aligned gather-index exactly.
+        # routing_map: [N, E] bool. permuted rows are expert-major. Per-token
+        # gather (token-major, expert ascending) is the masked_select of
+        # (token-position-in-expert + expert-offset) over routing_map columns.
+        rm_bool = routing_map.bool()
+        N, E = rm_bool.shape
+        rm_int_T = rm_bool.T.to(torch.int64)  # [E, N]
+        tpe = rm_int_T.sum(dim=-1)
+        expert_offsets = torch.zeros(E + 1, dtype=torch.int64, device=rm_int_T.device)
+        expert_offsets[1:] = torch.cumsum(tpe, dim=0)
+        global_pos = (rm_int_T.cumsum(dim=-1) - 1 + expert_offsets[:-1].unsqueeze(1)).T  # [N, E]
+        topk = int(rm_bool.sum(dim=-1).max())
+        gidx = torch.zeros(N * topk, dtype=torch.int64, device=routing_map.device)
+        flat_valid = torch.masked_select(
+            global_pos * rm_bool.to(torch.int64), rm_bool
+        ).reshape(-1, topk)
+        valid_rows_mask = rm_bool.sum(dim=-1) > 0
+        valid_idx = torch.nonzero(valid_rows_mask).reshape(-1)
+        # place per valid row's topk entries at token-major positions
+        nvalid = valid_idx.shape[0]
+        gidx_tm = torch.zeros(N, topk, dtype=torch.int64, device=routing_map.device)
+        gidx_tm[valid_idx, :] = flat_valid
+        rows = permuted_tokens.index_select(0, gidx_tm.reshape(-1)).reshape(
+            num_tokens, topk, hidden
+        )
+        output_tokens = torch.zeros(
+            (num_tokens, hidden), dtype=torch.float32, device=permuted_tokens.device
+        )
+        for _k in range(topk):
+            output_tokens = output_tokens + rows[:, _k, :].to(torch.float32)
+        return output_tokens.to(dtype=permuted_tokens.dtype)
 
     hidden = int(restore_shape[-1])
     output_tokens = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
@@ -560,7 +613,12 @@ def unpermute(
     # 在 unpermute（无 probs、非 drop_and_pad）的标准路径上改走 fp32 累加。
     # 由 use_accuracy_compatible 控制，关闭时保留原始 scatter_add_ 路径。
     if _use_accuracy_compatible() and probs is None and not drop_and_pad:
-        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        fp32_output = _fp32_accum_unpermute(
+            permuted_tokens,
+            sorted_indices,
+            restore_shape,
+            routing_map=routing_map,
+        )
         if fp32_output is not None:
             return fp32_output
 

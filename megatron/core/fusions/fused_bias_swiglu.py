@@ -3,12 +3,60 @@
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import _use_accuracy_compatible
 from megatron.core.utils import nvtx_decorator
+
+
+def _dump_swiglu_backward_operands(tag, grad_output, y, tmp):
+    """E-250: record what this backward actually consumed and produced.
+
+    Offline analysis narrowed the last dense-boundary divergence to the gate half of
+    this operation, but every conclusion there is conditional on the receipt-recorded
+    ``y`` and ``grad_output`` being the tensors this function actually sees. Fifteen
+    candidate arithmetic forms and precision placements of the recorded operands
+    reproduce the OTHER framework's record exactly and none reproduces this one's, which
+    is only explainable if an operand differs or the intermediate precision differs.
+
+    Writes raw bit patterns plus dtypes so both can be checked. Off unless
+    ``MODEL_REPRO_SWIGLU_BWD_DIR`` is set, so default runs are untouched.
+    """
+    output_dir = os.environ.get('MODEL_REPRO_SWIGLU_BWD_DIR')
+    if not output_dir:
+        return
+    import hashlib
+    import json
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    rank_dir = os.path.join(output_dir, f'rank{rank}')
+    os.makedirs(rank_dir, exist_ok=True)
+    state = getattr(_dump_swiglu_backward_operands, '_records', {})
+    call = sum(key.startswith(f'{tag}_call') for key in state)
+    records = {}
+    for name, tensor in (('y', y), ('grad_output', grad_output), ('tmp', tmp)):
+        flat = tensor.detach().contiguous().to(device='cpu')
+        raw = flat.view(torch.uint8).numpy().tobytes()
+        path = os.path.join(rank_dir, f'{tag}_call{call}_{name}.bin')
+        with open(path, 'wb') as stream:
+            stream.write(raw)
+        records[name] = {
+            'shape': list(flat.shape),
+            'dtype': str(flat.dtype),
+            'sha256': hashlib.sha256(raw).hexdigest(),
+            'raw_path': path,
+        }
+    state[f'{tag}_call{call}'] = records
+    _dump_swiglu_backward_operands._records = state
+    with open(os.path.join(rank_dir, 'metadata.json'), 'w', encoding='utf-8') as stream:
+        json.dump({'schema': 'glm52-swiglu-backward-operands/v1', 'framework': 'torch',
+                   'rank': rank, 'records': state}, stream, ensure_ascii=False, indent=2,
+                  sort_keys=True)
+        stream.write('\n')
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
@@ -220,6 +268,7 @@ class SwiGLUFunction(torch.autograd.Function):
             tmp = swiglu_back_eager(grad_output, input)
         else:
             tmp = swiglu_back(grad_output, input)
+        _dump_swiglu_backward_operands('SwiGLUFunction', grad_output, input, tmp)
         return tmp, None, None
 
 

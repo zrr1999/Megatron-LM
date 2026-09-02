@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Set, Union, cast
@@ -690,7 +691,147 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            _fln_x = hidden_states
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            _handoff = os.environ.get("MODEL_REPRO_MTP_HANDOFF_DUMP_DIR")
+            if _handoff:
+                import hashlib as _h
+                import torch.distributed as _td
+
+                _rank = _td.get_rank() if _td.is_initialized() else 0
+                os.makedirs(_handoff, exist_ok=True)
+                if not hasattr(self, "_e676_dumped"):
+                    self._e676_dumped = set()
+                for _name, _t in (("fln_in", _fln_x), ("fln_out", hidden_states)):
+                    _key = (_name, int(_rank))
+                    if _key in self._e676_dumped:
+                        continue
+                    self._e676_dumped.add(_key)
+                    _arr = _t.detach().float().cpu().numpy()
+                    _path = os.path.join(_handoff, f"torch_{_name}_r{_rank}.f32.bin")
+                    _arr.tofile(_path)
+                    print(
+                        f"[MTP-HANDOFF-DUMP] {_path} shape={tuple(_arr.shape)} "
+                        f"dtype={_arr.dtype} sha16={_h.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+            # E-538: hash-only final_ln X/Y/dY. Full QA hash + bwd hook observer-shifts
+            # dump-off IEEE to first_bad=2. E-544: Y-only jsonl, no W, no hook.
+            if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR"):
+                from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+                _w = getattr(self.final_layernorm, "weight", None)
+                _e497_qa_record("fln", _fln_x, hidden_states, _w, -1, False)
+            elif os.environ.get("MODEL_REPRO_FLN_BIN_DIR"):
+                # E-605: dump-off last-stage call-5 final_ln X/Y/W + incoming dX.
+                # Observation only. Do not set QA_XY (dump-on observer-shifts IEEE).
+                from megatron.core.transformer.multi_latent_attention import (
+                    _E497_QA_CALLS,
+                    _e497_qa_sha,
+                )
+                import json
+
+                _dump = os.environ["MODEL_REPRO_FLN_BIN_DIR"]
+                _rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                _key = f"flnbin|-1|0|{_rank}"
+                _E497_QA_CALLS[_key] = _E497_QA_CALLS.get(_key, 0) + 1
+                _call = _E497_QA_CALLS[_key]
+                _seq = int(_fln_x.shape[0]) if _fln_x is not None and getattr(_fln_x, "ndim", 0) >= 2 else 0
+                if int(_rank) in (2, 3) and _seq == 18:
+                    os.makedirs(_dump, exist_ok=True)
+
+                    def _e605_write(stem, t, kind, *, _dump=_dump, _rank=_rank, _call=_call):
+                        arr = t.detach().contiguous()
+                        u16 = arr.view(torch.uint16).cpu().numpy()
+                        u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                        meta = {
+                            "framework": "torch",
+                            "kind": kind,
+                            "tag": "fln",
+                            "rank": int(_rank),
+                            "layer": -1,
+                            "mtp": 0,
+                            "call": int(_call),
+                            "shape": list(arr.shape),
+                            "dtype": str(arr.dtype),
+                            "sha": _e497_qa_sha(t),
+                            "suffix": "u16",
+                        }
+                        with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                            json.dump(meta, handle, sort_keys=True)
+                            handle.write("\n")
+
+                    _stem = f"torch_fln_r{_rank}_c{_call}_L-1"
+                    _w = getattr(self.final_layernorm, "weight", None)
+                    _e605_write(f"{_stem}_x", _fln_x, "x")
+                    _e605_write(f"{_stem}_y", hidden_states, "y")
+                    if _w is not None:
+                        _e605_write(f"{_stem}_w", _w, "w")
+                    if not getattr(self, "_e605_fln_announced", False):
+                        print(
+                            f"[E632-FLNDX-BIN] dir={_dump} rank={_rank} call={_call}",
+                            flush=True,
+                        )
+                        self._e605_fln_announced = True
+
+                    def _on_fln_bin_dy(g, *, _stem=_stem):
+                        if g is None:
+                            return g
+                        _e605_write(f"{_stem}_dy", g, "dy")
+                        return g
+
+                    def _on_fln_bin_dx(g, *, _stem=_stem):
+                        if g is None:
+                            return g
+                        _e605_write(f"{_stem}_dx", g, "dx")
+                        return g
+
+                    if hidden_states.requires_grad:
+                        hidden_states.register_hook(_on_fln_bin_dy)
+                    if _fln_x is not None and getattr(_fln_x, "requires_grad", False):
+                        _fln_x.register_hook(_on_fln_bin_dx)
+            elif os.environ.get("MODEL_REPRO_FLN_Y_HASH_DIR"):
+                from megatron.core.transformer.multi_latent_attention import (
+                    _E497_QA_CALLS,
+                    _e497_qa_sha,
+                )
+                import json
+
+                _dump = os.environ["MODEL_REPRO_FLN_Y_HASH_DIR"]
+                _rank = (
+                    torch.distributed.get_rank()
+                    if torch.distributed.is_initialized()
+                    else 0
+                )
+                _key = f"flny|-1|0|{_rank}"
+                _E497_QA_CALLS[_key] = _E497_QA_CALLS.get(_key, 0) + 1
+                _call = _E497_QA_CALLS[_key]
+                os.makedirs(_dump, exist_ok=True)
+                _rec = {
+                    "kind": "fwd",
+                    "tag": "fln",
+                    "layer": -1,
+                    "mtp": 0,
+                    "rank": int(_rank),
+                    "call": int(_call),
+                    "shape_y": list(hidden_states.shape),
+                    "dtype_y": str(hidden_states.dtype),
+                    "sha_y": _e497_qa_sha(hidden_states),
+                }
+                with open(
+                    os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8"
+                ) as stream:
+                    stream.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+                if not getattr(self, "_e544_flny_announced", False):
+                    print(
+                        f"[E544-FLN-Y-HASH] dir={_dump} rank={_rank} call={_call}",
+                        flush=True,
+                    )
+                    self._e544_flny_announced = True
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.

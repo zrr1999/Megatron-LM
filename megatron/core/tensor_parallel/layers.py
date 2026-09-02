@@ -197,6 +197,142 @@ def _initialize_affine_weight_cpu(
     return None
 
 
+_EMBED_IDS_CALL = 0
+_EMBED_DY_HITS = 0
+_EMBED_Y_HITS = 0
+_EMBED_W_AT_FUSED_HITS = 0
+
+
+def _maybe_register_embed_dy_dump(output_parallel, masked_input):
+    """Dump-only live dY of VocabParallelEmbedding (E-530). Observation hook.
+
+    MODEL_REPRO_EMBED_DY_DIR: bin dump (dump-on). MODEL_REPRO_EMBED_DY_HASH_DIR:
+    jsonl sha only (dump-off; no bin). Hook returns g unchanged.
+    """
+    dump = os.environ.get("MODEL_REPRO_EMBED_DY_DIR")
+    hashdir = os.environ.get("MODEL_REPRO_EMBED_DY_HASH_DIR")
+    if not dump and not hashdir:
+        return output_parallel
+
+    def _hook(grad_output):
+        import hashlib
+        import json
+
+        global _EMBED_DY_HITS
+        _EMBED_DY_HITS += 1
+        hit = _EMBED_DY_HITS
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        idn = masked_input.detach().cpu().numpy()
+        dy_f32 = grad_output.detach().float().cpu().numpy()
+        rec = {
+            "kind": "bwd",
+            "tag": "embed_dy",
+            "framework": "torch",
+            "rank": int(rank),
+            "hit": int(hit),
+            "ids_shape": list(idn.shape),
+            "dy_shape": list(dy_f32.shape),
+            "ids_n": int(idn.size),
+            "dy_sha256": hashlib.sha256(dy_f32.tobytes()).hexdigest(),
+            "ids_sha256": hashlib.sha256(idn.tobytes()).hexdigest(),
+        }
+        if hashdir:
+            os.makedirs(hashdir, exist_ok=True)
+            with open(
+                os.path.join(hashdir, f"rank{rank}.jsonl"), "a", encoding="utf-8"
+            ) as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if hit == 1:
+                print(
+                    f"[E546-EMBED-DY-HASH] dir={hashdir} rank={rank} hit={hit} "
+                    f"ids_n={rec['ids_n']} sha={rec['dy_sha256'][:16]}",
+                    flush=True,
+                )
+        if dump and int(idn.size) in (36, 37):
+            os.makedirs(dump, exist_ok=True)
+            stem = f"torch_embed_dy_r{rank}_h{hit}_L{int(idn.size)}"
+            dy_f32.tofile(os.path.join(dump, f"{stem}.f32.bin"))
+            idn.tofile(os.path.join(dump, f"{stem}_ids.i64.bin"))
+            with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(rec, handle, sort_keys=True)
+                handle.write("\n")
+            print(
+                f"[E612-EMBED-DY-DUMP] r{rank} hit={hit} "
+                f"ids={tuple(idn.shape)} dy={tuple(dy_f32.shape)} "
+                f"sha={rec['dy_sha256'][:16]}",
+                flush=True,
+            )
+        return grad_output
+
+    output_parallel.register_hook(_hook)
+    return output_parallel
+
+
+def _dump_embed_lookup_ids(input_, masked_input, input_mask, vocab_start, vocab_end):
+    """Dump-only embedding lookup ids. Observation, not a wrap."""
+    dump = os.environ.get("MODEL_REPRO_EMBED_IDS_DIR")
+    hashdir = os.environ.get("MODEL_REPRO_EMBED_IDS_HASH_DIR")
+    if not dump and not hashdir:
+        return
+    import hashlib
+    import json
+
+    global _EMBED_IDS_CALL
+    _EMBED_IDS_CALL += 1
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    step_env = os.environ.get("MODEL_REPRO_STEP", "")
+    ids = masked_input.detach().cpu().numpy()
+    raw = input_.detach().cpu().numpy()
+    mask = None
+    if input_mask is not None:
+        mask = input_mask.detach().cpu().numpy().astype("uint8")
+    n = int(ids.size)
+    prefix = ids.reshape(-1)[:-1] if n > 1 else ids.reshape(-1)
+    meta = {
+        "kind": "fwd",
+        "tag": "embed_ids",
+        "framework": "torch",
+        "rank": rank,
+        "call": _EMBED_IDS_CALL,
+        "step_env": step_env,
+        "shape": list(ids.shape),
+        "n": n,
+        "vocab_start": int(vocab_start),
+        "vocab_end": int(vocab_end),
+        "masked_sha256": hashlib.sha256(ids.tobytes()).hexdigest(),
+        "input_sha256": hashlib.sha256(raw.tobytes()).hexdigest(),
+        "prefix_n": int(prefix.size),
+        "prefix_sha256": hashlib.sha256(prefix.tobytes()).hexdigest(),
+        "n_oov": int(mask.sum()) if mask is not None else 0,
+        "n_unique_masked": int(len(set(ids.reshape(-1).tolist()))),
+    }
+    if hashdir:
+        os.makedirs(hashdir, exist_ok=True)
+        with open(os.path.join(hashdir, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(meta, ensure_ascii=False) + "\n")
+        if _EMBED_IDS_CALL == 1:
+            print(
+                f"[E611-EMBED-IDS-HASH] dir={hashdir} rank={rank} "
+                f"n={n} prefix_n={meta['prefix_n']}",
+                flush=True,
+            )
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+        stem = f"torch_embed_r{rank}_c{_EMBED_IDS_CALL}_L{int(ids.size)}"
+        ids.tofile(os.path.join(dump, f"{stem}_masked.i64.bin"))
+        raw.tofile(os.path.join(dump, f"{stem}_input.i64.bin"))
+        if mask is not None:
+            mask.tofile(os.path.join(dump, f"{stem}_mask.u8.bin"))
+        with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle, sort_keys=True)
+            handle.write("\n")
+        print(
+            f"[EMBED-IDS-DUMP] r{rank} c{_EMBED_IDS_CALL} n={ids.size} "
+            f"step_env={step_env} oov={meta['n_oov']} sha={meta['masked_sha256'][:16]}",
+            flush=True,
+        )
+
+
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -297,12 +433,229 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
+            input_mask = None
+        _dump_embed_lookup_ids(
+            input_,
+            masked_input,
+            input_mask,
+            self.vocab_start_index,
+            self.vocab_end_index,
+        )
+        # E-576 dump-off: lookup W hash once per rank. Observation only.
+        dump_w = os.environ.get("MODEL_REPRO_EMBED_W_HASH_DIR")
+        if dump_w and not getattr(self, "_e576_w_hashed", False):
+            import hashlib
+            import json
+
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            os.makedirs(dump_w, exist_ok=True)
+            w = self.weight.detach().cpu()
+            rec = {
+                "kind": "param",
+                "tag": "embed_w",
+                "framework": "torch",
+                "rank": int(rank),
+                "shape": list(w.shape),
+                "dtype": str(w.dtype),
+                "sha_w": hashlib.sha256(
+                    w.contiguous().view(torch.uint16).numpy().tobytes()
+                    if w.dtype == torch.bfloat16
+                    else w.contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "vocab_start": int(self.vocab_start_index),
+                "vocab_end": int(self.vocab_end_index),
+            }
+            with open(os.path.join(dump_w, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            print(
+                f"[E576-EMBED-W-HASH] dir={dump_w} rank={rank} shape={rec['shape']} "
+                f"sha={rec['sha_w'][:16]}",
+                flush=True,
+            )
+            self._e576_w_hashed = True
+        # E-578 dump-off: W at fused-equivalent n=168 calls, not first lookup.
+        dump_w_fused = os.environ.get("MODEL_REPRO_EMBED_W_AT_FUSED_HASH_DIR")
+        if dump_w_fused:
+            import hashlib
+            import json
+
+            idn = int(masked_input.numel())
+            if idn in (36, 37, 168, 169):
+                global _EMBED_W_AT_FUSED_HITS
+                _EMBED_W_AT_FUSED_HITS += 1
+                hit = _EMBED_W_AT_FUSED_HITS
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                os.makedirs(dump_w_fused, exist_ok=True)
+                w = self.weight.detach().cpu()
+                rec = {
+                    "kind": "param",
+                    "tag": "embed_w_at_fused",
+                    "framework": "torch",
+                    "rank": int(rank),
+                    "hit": int(hit),
+                    "ids_n": int(idn),
+                    "shape": list(w.shape),
+                    "dtype": str(w.dtype),
+                    "sha_w": hashlib.sha256(
+                        w.contiguous().view(torch.uint16).numpy().tobytes()
+                        if w.dtype == torch.bfloat16
+                        else w.contiguous().numpy().tobytes()
+                    ).hexdigest(),
+                    "vocab_start": int(self.vocab_start_index),
+                    "vocab_end": int(self.vocab_end_index),
+                }
+                with open(
+                    os.path.join(dump_w_fused, f"rank{rank}.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(
+                    f"[E611-EMBED-W-AT-FUSED-HASH] dir={dump_w_fused} rank={rank} "
+                    f"hit={hit} ids_n={idn} sha={rec['sha_w'][:16]}",
+                    flush=True,
+                )
+        # E-579 dump-off: unique W rows at first n=168, not the 905MiB table.
+        dump_rows = os.environ.get("MODEL_REPRO_EMBED_W_ROWS_DIR")
+        if dump_rows and int(masked_input.numel()) == 168:
+            import hashlib
+            import json
+
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if not getattr(self, "_e579_rows_dumped", False):
+                os.makedirs(dump_rows, exist_ok=True)
+                ids_full = masked_input.detach().reshape(-1)
+                uniq = torch.unique(ids_full)
+                rows = self.weight.detach()[uniq].contiguous().cpu()
+                uniq_np = uniq.cpu().numpy()
+                rows_u16 = (
+                    rows.view(torch.uint16).numpy()
+                    if rows.dtype == torch.bfloat16
+                    else rows.numpy()
+                )
+                stem = f"torch_embed_w_rows_r{rank}_n168"
+                uniq_np.astype("int64").tofile(os.path.join(dump_rows, f"{stem}_ids.i64.bin"))
+                rows_u16.tofile(os.path.join(dump_rows, f"{stem}.u16.bin"))
+                rec = {
+                    "kind": "param",
+                    "tag": "embed_w_rows",
+                    "framework": "torch",
+                    "rank": int(rank),
+                    "ids_n": 168,
+                    "n_unique": int(uniq_np.size),
+                    "shape_rows": list(rows.shape),
+                    "sha_rows": hashlib.sha256(rows_u16.tobytes()).hexdigest(),
+                    "sha_uniq_ids": hashlib.sha256(uniq_np.tobytes()).hexdigest(),
+                    "vocab_start": int(self.vocab_start_index),
+                    "vocab_end": int(self.vocab_end_index),
+                    "sha_w_full": hashlib.sha256(
+                        self.weight.detach()
+                        .contiguous()
+                        .cpu()
+                        .view(torch.uint16)
+                        .numpy()
+                        .tobytes()
+                    ).hexdigest()
+                    if self.weight.dtype == torch.bfloat16
+                    else None,
+                }
+                with open(
+                    os.path.join(dump_rows, f"{stem}.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(rec, handle, sort_keys=True)
+                with open(
+                    os.path.join(dump_rows, f"rank{rank}.jsonl"),
+                    "a",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                print(
+                    f"[E579-EMBED-W-ROWS] dir={dump_rows} rank={rank} "
+                    f"n_unique={rec['n_unique']} sha_w={rec['sha_w_full'][:16] if rec['sha_w_full'] else None}",
+                    flush=True,
+                )
+                self._e579_rows_dumped = True
         # Get the embeddings.
         if self.deterministic_mode:
             output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, self.weight)
+        output_parallel = _maybe_register_embed_dy_dump(output_parallel, masked_input)
+        # E-574 dump-off: lookup Y (pre-OOV-mask) + dY. Torch first has no extra
+        # token; prefix is the full tensor. Separate env from EMBED_DY / SLICE.
+        dump_y = os.environ.get("MODEL_REPRO_EMBED_Y_HASH_DIR")
+        if dump_y:
+            import hashlib
+            import json
+
+            global _EMBED_Y_HITS
+            _EMBED_Y_HITS += 1
+            hit = _EMBED_Y_HITS
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            os.makedirs(dump_y, exist_ok=True)
+            y = output_parallel.detach().cpu()
+            rec = {
+                "kind": "fwd",
+                "tag": "embed_y",
+                "framework": "torch",
+                "rank": int(rank),
+                "hit": int(hit),
+                "ids_n": int(masked_input.numel()),
+                "shape_y": list(y.shape),
+                "sha_y": hashlib.sha256(
+                    y.contiguous().view(torch.uint16).numpy().tobytes()
+                    if y.dtype == torch.bfloat16
+                    else y.contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "shape_y_prefix": list(y.shape),
+                "sha_y_prefix": hashlib.sha256(
+                    y.contiguous().view(torch.uint16).numpy().tobytes()
+                    if y.dtype == torch.bfloat16
+                    else y.contiguous().numpy().tobytes()
+                ).hexdigest(),
+            }
+            with open(os.path.join(dump_y, f"rank{rank}.jsonl"), "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if hit == 1:
+                print(
+                    f"[E610-EMBED-Y-HASH] dir={dump_y} rank={rank} hit={hit} "
+                    f"ids_n={rec['ids_n']}",
+                    flush=True,
+                )
+
+            def _on_embed_y_dy(g, *, _dump=dump_y, _rank=rank, _hit=hit, _ids_n=int(masked_input.numel())):
+                if g is None:
+                    return g
+                seq = int(g.shape[1]) if g.ndim >= 2 else int(g.shape[0])
+                bwd = {
+                    "kind": "bwd",
+                    "tag": "embed_y",
+                    "framework": "torch",
+                    "rank": int(_rank),
+                    "hit": int(_hit),
+                    "ids_n": int(_ids_n),
+                    "shape_dy": list(g.shape),
+                    "sha_dy": hashlib.sha256(
+                        g.detach().contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                        if g.dtype == torch.bfloat16
+                        else g.detach().contiguous().cpu().numpy().tobytes()
+                    ).hexdigest(),
+                    "shape_dy_prefix": list(g.shape),
+                    "sha_dy_prefix": hashlib.sha256(
+                        g.detach().contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                        if g.dtype == torch.bfloat16
+                        else g.detach().contiguous().cpu().numpy().tobytes()
+                    ).hexdigest(),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            if output_parallel.requires_grad:
+                output_parallel.register_hook(_on_embed_y_dy)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
@@ -777,6 +1130,31 @@ def linear_with_grad_accumulation_and_async_allreduce(
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
+def _expert_grads_need_own_dp_domain(config) -> bool:
+    """Whether expert parameters must be reduced over the expert-data-parallel group.
+
+    mcore normally decides this from ``expert_model_parallel_size > 1`` alone, which
+    is correct only when the expert tensor-parallel size equals the dense one: the
+    expert parameter is then sharded exactly like a dense parameter and its
+    data-parallel domain coincides with ``dp_cp``.
+
+    With ``expert_tensor_parallel_size < tensor_model_parallel_size`` (the accuracy
+    -compatible topology uses ETP=1 with TP=2) every rank in the tensor-parallel
+    group holds a FULL copy of the expert weight while consuming only its own
+    sequence-parallel shard of the tokens. Those partial weight gradients live in a
+    larger data-parallel domain (``expt_dp`` = TP/ETP times ``dp_cp``) and must be
+    summed. Leaving ``allreduce=True`` puts them in the dense bucket, which is
+    reduced over ``dp_cp`` — size 1 in this topology — so the reduction silently
+    never happens and every expert gradient stays a per-rank partial sum.
+    """
+    if config.expert_model_parallel_size > 1:
+        return True
+    etp = getattr(config, 'expert_tensor_parallel_size', None)
+    if etp is None:
+        return False
+    return etp != config.tensor_model_parallel_size
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -921,7 +1299,11 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.weight = None
 
@@ -943,7 +1325,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -1271,7 +1657,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
 
         if bias:
             if config.use_cpu_initialization:
@@ -1289,7 +1679,11 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)

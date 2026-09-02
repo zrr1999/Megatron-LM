@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -863,6 +864,17 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
 
         # Unpermutation 1: AlltoAll output to output
+        _dump_dir = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+        if _dump_dir:
+            import torch.distributed as _dist
+            _dr = _dist.get_rank() if _dist.is_initialized() else 0
+            os.makedirs(_dump_dir, exist_ok=True)
+            self.reversed_local_input_permutation_mapping.detach().cpu().numpy().tofile(
+                os.path.join(_dump_dir, f"torch_sorted_indices_r{_dr}.i64.bin")
+            )
+            permutated_local_input_tokens.detach().float().cpu().numpy().tofile(
+                os.path.join(_dump_dir, f"torch_permuted_weighted_r{_dr}.f32.bin")
+            )
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
@@ -871,6 +883,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
+        _idx_dump = os.environ.get("MODEL_REPRO_UNPERM_INDEX_DUMP")
+        if _idx_dump:
+            import torch.distributed as _tdix
+
+            _ir = _tdix.get_rank() if _tdix.is_initialized() else 0
+            os.makedirs(_idx_dump, exist_ok=True)
+            self.reversed_local_input_permutation_mapping.detach().cpu().numpy().astype(
+                "int64"
+            ).tofile(os.path.join(_idx_dump, f"torch_sorted_indices_r{_ir}.i64.bin"))
+            if self.routing_map is not None:
+                self.routing_map.to(torch.uint8).detach().cpu().numpy().tofile(
+                    os.path.join(_idx_dump, f"torch_routing_map_r{_ir}.u8.bin")
+                )
+            with open(os.path.join(_idx_dump, f"torch_unperm_meta_r{_ir}.txt"), "w") as _mf:
+                _mf.write(
+                    f"restore={tuple(self.hidden_shape_before_permute)} "
+                    f"perm={tuple(permutated_local_input_tokens.shape)} "
+                    f"si={tuple(self.reversed_local_input_permutation_mapping.shape)} "
+                    f"tp_size={self.tp_size} ep_size={self.ep_size}\n"
+                )
 
         # Reshape the output tensor
         output = output.view(self.hidden_shape)

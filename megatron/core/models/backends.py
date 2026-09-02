@@ -10,6 +10,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
+from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
@@ -98,6 +99,14 @@ class BackendSpecProvider(Protocol):
 
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local submodules used in Spec building."""
+
+    def linear(self) -> type:
+        """TP-replicated Linear (Megatron TELinear parallel_mode=duplicated).
+
+        DSA indexer / MLA down-projections call backend.linear(). Without this
+        method, mcore_bridge _replace_spec_dsa can only use TESpecProvider.
+        """
+        return Linear
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""

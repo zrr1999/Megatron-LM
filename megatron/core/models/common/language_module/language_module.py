@@ -227,6 +227,18 @@ class LanguageModule(MegatronModule):
                 f"md5={_hashlib.md5(_l.cpu().numpy().tobytes()).hexdigest()}",
                 flush=True,
             )
+            if os.environ.get('MODEL_REPRO_PER_TOKEN_VALUES'):
+                # An md5 tells you the buffers differ, not where. The masked sum can be
+                # bit-identical while ignored positions differ, so the digest alone cannot
+                # say whether a SUPERVISED position disagrees. Print the values (one short
+                # sequence) so the two stacks can be compared position by position.
+                _flat = _l.reshape(-1).cpu().numpy()
+                print(
+                    f"per_token_loss_values: rank={torch.distributed.get_rank()} "
+                    f"n={_flat.size} "
+                    f"hex={_flat.tobytes().hex()}",
+                    flush=True,
+                )
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:

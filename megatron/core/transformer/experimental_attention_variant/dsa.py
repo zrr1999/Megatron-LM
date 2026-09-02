@@ -54,6 +54,70 @@ def source_dsa_compute_layer(layer_number: int, skip_topk_offset: int, topk_freq
     return layer_number - ((layer_number - skip_topk_offset) % topk_freq)
 
 
+def _e519_dump_unfused_torch(
+    *,
+    query,
+    key,
+    topk_indices,
+    scores_pre_mask,
+    index_mask,
+    probs,
+    latent,
+    softmax_scale,
+    v_channels,
+    accuracy_compatible,
+) -> None:
+    import json
+    import os
+
+    dump = os.environ.get("MODEL_REPRO_CORE_OP_DUMP_DIR")
+    if not dump:
+        return
+    import torch.distributed as dist
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return
+    n = int(getattr(_e519_dump_unfused_torch, "_n", 0))
+    _e519_dump_unfused_torch._n = n + 1
+    call = n + 1
+    os.makedirs(dump, exist_ok=True)
+    sq = int(query.shape[0])
+    stem = f"torch_r{rank}_c{call}_s{sq}"
+    meta = {
+        "framework": "torch",
+        "rank": int(rank),
+        "call": int(call),
+        "shape_q": list(query.shape),
+        "shape_k": list(key.shape),
+        "shape_topk": list(topk_indices.shape),
+        "shape_scores": list(scores_pre_mask.shape),
+        "shape_index_mask": list(index_mask.shape),
+        "shape_probs": list(probs.shape),
+        "shape_latent": list(latent.shape),
+        "softmax_scale": float(softmax_scale),
+        "v_channels": int(v_channels),
+        "accuracy_compatible": bool(accuracy_compatible),
+        "dtype_q": str(query.dtype),
+    }
+    query.detach().float().cpu().numpy().tofile(os.path.join(dump, f"{stem}_q.f32.bin"))
+    key.detach().float().cpu().numpy().tofile(os.path.join(dump, f"{stem}_k.f32.bin"))
+    topk_indices.detach().cpu().numpy().astype("int32").tofile(
+        os.path.join(dump, f"{stem}_topk.i32.bin")
+    )
+    scores_pre_mask.detach().float().cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_scores.f32.bin")
+    )
+    index_mask.detach().float().cpu().numpy().tofile(
+        os.path.join(dump, f"{stem}_index_mask.f32.bin")
+    )
+    probs.detach().float().cpu().numpy().tofile(os.path.join(dump, f"{stem}_probs.f32.bin"))
+    latent.detach().float().cpu().numpy().tofile(os.path.join(dump, f"{stem}_latent.f32.bin"))
+    with open(os.path.join(dump, f"{stem}_meta.json"), "w") as stream:
+        json.dump(meta, stream)
+        stream.write("\n")
+
+
 def _unfused_absorbed_dsa_fn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -87,6 +151,19 @@ def _unfused_absorbed_dsa_fn(
     # [skv,b,1,hn] -> [b,1,hn,skv]
     k = key.permute(1, 2, 3, 0)
     attention_scores = torch.matmul(q.float(), k.float()) * softmax_scale
+    scores_pre_mask = attention_scores
+
+    import os as _os
+    _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+    if _dump_dir and not getattr(_unfused_absorbed_dsa_fn, "_dump_done", False):
+        _unfused_absorbed_dsa_fn._dump_done = True
+        import numpy as _np
+        attention_scores.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_scores.bin"))
+        topk_indices.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_topk.bin"))
+        query.detach().cpu().view(torch.int16).numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_q_scores.bin"))
 
     # Sparse + causal/varlen validity mask.
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
@@ -98,6 +175,11 @@ def _unfused_absorbed_dsa_fn(
         varlen_ends=varlen_ends,
         key_positions=key_positions,
     )
+
+    if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_mask_done", False):
+        _unfused_absorbed_dsa_fn._dump_mask_done = True
+        index_mask.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_index_mask.bin"))
 
     attention_scores = attention_scores + index_mask.unsqueeze(1)
     valid_index_mask = torch.isfinite(index_mask).unsqueeze(1).expand(b, np, sq, skv)
@@ -112,7 +194,130 @@ def _unfused_absorbed_dsa_fn(
 
     # Latent value is the first v_channels slice of absorbed key cache.
     value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
+
+    _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+    if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_prob_done", False):
+        _unfused_absorbed_dsa_fn._dump_prob_done = True
+        import torch.distributed as _dist
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        attention_scores.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, f"torch_core_probs_r{_rank}.bin"))
     output = torch.matmul(attention_scores.to(value.dtype), value)  # [b,np,sq,v]
+    _e519_dump_unfused_torch(
+        query=query,
+        key=key,
+        topk_indices=topk_indices,
+        scores_pre_mask=scores_pre_mask,
+        index_mask=index_mask,
+        probs=attention_scores,
+        latent=output,
+        softmax_scale=softmax_scale,
+        v_channels=v_channels,
+        accuracy_compatible=accuracy_compatible,
+    )
+    # E-617 dump-off first-stage L0 unfused Q/K/latent at seq=18/36.
+    # E-640 also dumps last-stage MTP (is_mtp_layer) on ranks 2/3.
+    # Separate env from CORE_OP_DUMP_DIR (dump-on observer-shifts IEEE).
+    _e588_dump = _os.environ.get("MODEL_REPRO_UNFUSED_QK_BIN_DIR")
+    if _e588_dump:
+        import json as _json
+        import torch.distributed as _dist
+
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        _layer = int(getattr(_unfused_absorbed_dsa_fn, "_e588_layer", -1))
+        _mtp = bool(getattr(_unfused_absorbed_dsa_fn, "_e588_mtp", False))
+        _mtp_only = _os.environ.get("MODEL_REPRO_UNFUSED_MTP_ONLY", "0") == "1"
+        _first_l0 = (int(_rank) in (0, 1) and _layer in (1, 2)) or (
+            int(_rank) in (2, 3) and _layer in (3, 4)
+        )
+        _mtp_ok = _mtp and int(_rank) in (2, 3)
+        ntok = 0
+        for _t in (query, key, output):
+            if _t is None:
+                continue
+            for _d in list(_t.shape):
+                if int(_d) in (18, 36):
+                    ntok = int(_d)
+                    break
+            if ntok in (18, 36):
+                break
+        _gate = (_mtp_ok if _mtp_only else (_mtp_ok or _first_l0)) and ntok in (18, 36)
+        if _gate:
+            _key = f"unfused|{_rank}|{_layer}|{int(_mtp)}"
+            _n = int(getattr(_unfused_absorbed_dsa_fn, "_e588_n", {}).get(_key, 0)) + 1
+            _calls = getattr(_unfused_absorbed_dsa_fn, "_e588_n", {})
+            _calls[_key] = _n
+            _unfused_absorbed_dsa_fn._e588_n = _calls
+            _os.makedirs(_e588_dump, exist_ok=True)
+            if not getattr(_unfused_absorbed_dsa_fn, "_e617_announced", False):
+                _tag = "E640-UNFUSED-QK" if _mtp else "E629-UNFUSED-QK"
+                print(
+                    f"[{_tag}] dir={_e588_dump} rank={_rank} call={_n} L={_layer} mtp={int(_mtp)}",
+                    flush=True,
+                )
+                _unfused_absorbed_dsa_fn._e617_announced = True
+
+            def _e588_write(
+                stem,
+                t,
+                kind,
+                *,
+                _dump=_e588_dump,
+                _rn=_rank,
+                _cn=_n,
+                _ly=_layer,
+                _mtp_flag=_mtp,
+            ):
+                arr = t.detach().contiguous()
+                buf = arr.view(torch.uint16).cpu().numpy()
+                buf.tofile(_os.path.join(_dump, f"{stem}.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": kind,
+                    "tag": "unfused_qk",
+                    "rank": int(_rn),
+                    "call": int(_cn),
+                    "layer": int(_ly),
+                    "mtp": int(_mtp_flag),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "suffix": "u16",
+                }
+                with open(_os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                    _json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+
+            _stem = f"torch_unfused_r{_rank}_c{_n}_L{_layer}"
+            _e588_write(f"{_stem}_q", query, "q")
+            _e588_write(f"{_stem}_k", key, "k")
+            _e588_write(f"{_stem}_latent", output, "latent")
+            if query.requires_grad:
+
+                def _on_q_dy(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e588_write(f"{_stem}_q_dy", g, "q_dy")
+                    return g
+
+                query.register_hook(_on_q_dy)
+            if key.requires_grad:
+
+                def _on_k_dy(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e588_write(f"{_stem}_k_dy", g, "k_dy")
+                    return g
+
+                key.register_hook(_on_k_dy)
+            if output.requires_grad:
+
+                def _on_lat_dy(g, *, _stem=_stem):
+                    if g is None:
+                        return g
+                    _e588_write(f"{_stem}_latent_dy", g, "latent_dy")
+                    return g
+
+                output.register_hook(_on_lat_dy)
     return output.permute(2, 0, 1, 3).contiguous()
 
 
@@ -195,8 +400,24 @@ def _run_sparse_attention(
                 accuracy_compatible=accuracy_compatible,
             )
         assert output is not None
+        import os as _os
+        _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+        if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_latent_done", False):
+            _unfused_absorbed_dsa_fn._dump_latent_done = True
+            import torch.distributed as _dist
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            output.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_core_latent_r{_rank}.bin"))
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
+        if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_deabs_done", False):
+            _unfused_absorbed_dsa_fn._dump_deabs_done = True
+            import torch.distributed as _dist2
+            _rank2 = _dist2.get_rank() if _dist2.is_initialized() else 0
+            output.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_core_out_branch_r{_rank2}.bin"))
+            up_v_weight.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_up_v_weight_r{_rank2}.bin"))
         return output
 
     return unfused_dsa_fn(
@@ -1730,6 +1951,10 @@ class DSAttention(MegatronModule):
         """
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
+        # E-588: per-layer call counter for dump-off unfused Q/K (not a global
+        # mix of L0/L1/MTP). DSAttention.layer_number is 1-indexed.
+        _unfused_absorbed_dsa_fn._e588_layer = int(getattr(self, "layer_number", -1))
+        _unfused_absorbed_dsa_fn._e588_mtp = bool(getattr(self, "is_mtp_layer", False))
         if value is not None:
             value, _ = dsa_layout.ensure_sbhd(value, "value")
         if up_v_weight is not None:

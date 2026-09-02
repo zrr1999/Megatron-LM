@@ -13,6 +13,7 @@ can be more efficient for certain attention variants.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -222,6 +223,9 @@ class AbsorbedMLASelfAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
+        # E-640 dump-off: stamp MTP flag onto DSAttention so unfused QK
+        # records fire on last-stage MTP. Observation only; default path unchanged.
+        self.core_attention.is_mtp_layer = getattr(self, "is_mtp_layer", False)
 
         # Output.
         self.linear_proj = build_module(
@@ -382,6 +386,50 @@ class AbsorbedMLASelfAttention(Attention):
             eps=self.config.layernorm_epsilon,
         )
 
+        # Hash-only X/Y/dY of q_a_layernorm / kv_a_layernorm / q_up.
+        # Live torch attention is mcore_bridge.AbsorbedMLASelfAttention, which
+        # overrides get_query_key_value_tensors, so in-method records never fire.
+        # The subclass still uses these parent-built modules, so a module hook
+        # sees the live call. Hook returns outputs unchanged.
+        if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR"):
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _attn = self
+
+            def _norm_hook(mod, inp, out, *, _tag, _attn=_attn):
+                y = out[0] if isinstance(out, tuple) else out
+                x = inp[0] if isinstance(inp, tuple) else inp
+                _e497_qa_record(
+                    _tag,
+                    x,
+                    y,
+                    getattr(mod, "weight", None),
+                    getattr(_attn, "layer_number", -1),
+                    getattr(_attn, "is_mtp_layer", False),
+                )
+
+            def _qup_hook(mod, inp, out, *, _attn=_attn):
+                y = out[0] if isinstance(out, tuple) else out
+                x = inp[0] if isinstance(inp, tuple) else inp
+                _e497_qa_record(
+                    "qup",
+                    x,
+                    y,
+                    getattr(mod, "weight", None),
+                    getattr(_attn, "layer_number", -1),
+                    getattr(_attn, "is_mtp_layer", False),
+                )
+
+            if getattr(self, "q_layernorm", None) is not None:
+                self.q_layernorm.register_forward_hook(
+                    lambda m, i, o: _norm_hook(m, i, o, _tag="qaln")
+                )
+            self.kv_layernorm.register_forward_hook(
+                lambda m, i, o: _norm_hook(m, i, o, _tag="kvaln")
+            )
+            if getattr(self, "linear_q_up_proj", None) is not None:
+                self.linear_q_up_proj.register_forward_hook(_qup_hook)
+
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -454,6 +502,16 @@ class AbsorbedMLASelfAttention(Attention):
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.linear_q_down_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -475,6 +533,16 @@ class AbsorbedMLASelfAttention(Attention):
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.linear_kv_down_proj, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
         if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
             # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
@@ -510,9 +578,31 @@ class AbsorbedMLASelfAttention(Attention):
         # =========================================
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
-            q_compressed = self.q_layernorm(q_compressed)
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
 
+            _qaln_x = q_compressed
+            q_compressed = self.q_layernorm(q_compressed)
+            _e497_qa_record(
+                "qaln",
+                _qaln_x,
+                q_compressed,
+                getattr(self.q_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
+
+        _kvaln_x = kv_compressed
         kv_compressed = self.kv_layernorm(kv_compressed)
+        from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+        _e497_qa_record(
+            "kvaln",
+            _kvaln_x,
+            kv_compressed,
+            getattr(self.kv_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
         # Because we won't apply V up projection to the compressed KV, so we need to gather it
         # manually.
         if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
@@ -532,7 +622,17 @@ class AbsorbedMLASelfAttention(Attention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
                 q, _ = self.linear_q_up_proj(q_compressed)
+                _e497_qa_record(
+                    "qup",
+                    q_compressed,
+                    q,
+                    getattr(self.linear_q_up_proj, "weight", None),
+                    getattr(self, "layer_number", -1),
+                    getattr(self, "is_mtp_layer", False),
+                )
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]

@@ -11,6 +11,10 @@ from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import hashlib
+import json
+import os
+
 import torch
 from typing_extensions import override
 
@@ -53,6 +57,130 @@ from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+
+def _sha256_tensor(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().contiguous().to(device="cpu")
+    return hashlib.sha256(cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def _dump_post_optimizer_params(optimizer) -> None:
+    """Dump-only bf16 params + fp32 masters. Observation, not a wrap.
+
+    e449 PYTHONPATH dump trees shift torch step-2 (doNotRepeat). This hook
+    lives on Megatron-LM-e495 and must not change GEMM/backward.
+    """
+    output_dir = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_DIR")
+    if not output_dir:
+        return
+    step = int(os.environ.get("MODEL_REPRO_STEP", "1"))
+    want = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_STEPS", "3")
+    allowed = {piece.strip() for piece in want.split(",") if piece.strip()}
+    # Swift sets MODEL_REPRO_STEP to the 0-based iteration before optimizer.step.
+    dump_step = step + 1
+    if allowed and str(dump_step) not in allowed:
+        return
+    needles_raw = os.environ.get(
+        "MODEL_REPRO_POST_OPT_PARAM_MATCH",
+        "linear_q_down_proj,linear_kv_down_proj,enorm,hnorm",
+    )
+    needles = [piece.strip() for piece in needles_raw.split(",") if piece.strip()]
+    # Float16OptimizerWithFloat16Params has no model_chunks; names are empty.
+    # Match replicated MLA down-projections by the live Linear weight shapes.
+    shape_needles = set()
+    if any("q_down" in n or "q_a" in n for n in needles):
+        shape_needles.add((2048, 6144))
+    if any("kv_down" in n or "kv_a" in n for n in needles):
+        shape_needles.add((576, 6144))
+    # E-523: VocabParallelEmbedding TP shard is [vocab/TP, hidden] = [77440, 6144].
+    # Names on this optimizer are inner.g.p indices, so match by shape.
+    if any("embed" in n or "word_embeddings" in n for n in needles):
+        shape_needles.add((77440, 6144))
+    # RMSNorm scales are 1-D [6144] / [2048] / [512]; too many aliases to
+    # disambiguate by shape. enorm/hnorm stay name-matched when names exist.
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    inners = []
+    if getattr(optimizer, "chained_optimizers", None):
+        inners.extend(optimizer.chained_optimizers)
+    else:
+        inners.append(optimizer)
+    named = []
+    for inner_index, inner in enumerate(inners):
+        chunks = getattr(inner, "model_chunks", None) or []
+        for chunk in chunks:
+            if hasattr(chunk, "named_parameters"):
+                for name, param in chunk.named_parameters():
+                    named.append((name, param, inner, getattr(param, "main_param", None)))
+        groups = getattr(inner, "float16_groups", None) or []
+        mains = getattr(inner, "fp32_from_float16_groups", None) or []
+        for gi, group in enumerate(groups):
+            main_group = mains[gi] if gi < len(mains) else []
+            for pi, param in enumerate(group):
+                master = main_group[pi] if pi < len(main_group) else getattr(param, "main_param", None)
+                named.append((f"inner{inner_index}.g{gi}.p{pi}", param, inner, master))
+    records = []
+    raw_needles_env = os.environ.get("MODEL_REPRO_POST_OPT_PARAM_RAW", "")
+    raw_needles = [piece.strip() for piece in raw_needles_env.split(",") if piece.strip()]
+    raw_dir = os.path.join(output_dir, "raw")
+    if raw_needles or shape_needles:
+        os.makedirs(raw_dir, exist_ok=True)
+    seen = set()
+    for name, param, inner, master in named:
+        key = id(param)
+        if key in seen:
+            continue
+        seen.add(key)
+        shape = tuple(int(x) for x in param.shape)
+        name_hit = bool(needles) and any(needle in name for needle in needles)
+        shape_hit = shape in shape_needles
+        if needles and not name_hit and not shape_hit:
+            continue
+        rec = {
+            "name": name,
+            "shape": list(param.shape),
+            "dtype": str(param.dtype),
+            "numel": int(param.numel()),
+            "sha256": _sha256_tensor(param),
+        }
+        if param.ndim == 2:
+            rec["transpose_sha256"] = hashlib.sha256(
+                param.detach().transpose(0, 1).contiguous().cpu().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+        if master is None:
+            master = getattr(param, "main_param", None)
+        if master is not None:
+            rec["master_dtype"] = str(master.dtype)
+            rec["master_sha256"] = _sha256_tensor(master)
+            rec["master_shape"] = list(master.shape)
+        records.append(rec)
+        if shape_hit or (raw_needles and any(needle in name for needle in raw_needles)):
+            safe = f"s{shape[0]}x{shape[1]}_{name.replace('/', '_').replace('.', '_')}"
+            param.detach().contiguous().cpu().view(torch.uint8).numpy().tofile(
+                os.path.join(raw_dir, f"rank{rank}_step{dump_step}_{safe}_param.bin")
+            )
+            if master is not None:
+                master.detach().contiguous().cpu().numpy().tofile(
+                    os.path.join(raw_dir, f"rank{rank}_step{dump_step}_{safe}_master.bin")
+                )
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"rank{rank}_step{dump_step}.json")
+    payload = {
+        "schema": "glm52-post-optimizer-param-inventory/v1",
+        "framework": "torch",
+        "rank": rank,
+        "step": dump_step,
+        "parameters": records,
+        "parameter_count": len(records),
+        "inner_types": [type(inner).__name__ for inner in inners],
+    }
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    print(
+        f"[POST-OPT-PARAM] torch rank={rank} step={dump_step} n={len(records)} "
+        f"inners={payload['inner_types']}",
+        flush=True,
+    )
 
 
 def _zero_grad_group_helper(
@@ -771,6 +899,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-count-zeros').stop()
 
         success = self.step_with_ready_grads()
+
+        if success:
+            _dump_post_optimizer_params(self)
 
         # Successful update.
         return success, grad_norm, num_zeros_in_grad
@@ -1737,6 +1868,9 @@ class ChainedOptimizer(MegatronOptimizer):
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         update_successful = False if should_skip_update else self.step_with_ready_grads()
+
+        if update_successful:
+            _dump_post_optimizer_params(self)
 
         return update_successful, grad_norm, num_zeros_in_grad
 

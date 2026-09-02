@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
+import os
 
 import functools
 import logging
@@ -11,6 +12,34 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 import torch
 import torch.distributed
 from torch import Tensor
+
+# E-674: last-decoder residual dump. Needle: [MTP-PRE-DUMP]
+_MTP_PRE_DUMPED = set()
+
+
+def _mtp_pre_dump_layer(tensor, name, layer_idx):
+    dump_dir = os.environ.get("MODEL_REPRO_MTP_PRE_DUMP_DIR")
+    if not dump_dir or tensor is None:
+        return
+    import hashlib
+    import torch.distributed as _td
+
+    rank = _td.get_rank() if _td.is_initialized() else 0
+    key = (name, int(layer_idx) if layer_idx is not None else -1, int(rank))
+    if key in _MTP_PRE_DUMPED:
+        return
+    _MTP_PRE_DUMPED.add(key)
+    os.makedirs(dump_dir, exist_ok=True)
+    arr = tensor.detach().float().cpu().numpy()
+    path = os.path.join(dump_dir, f"torch_{name}_l{layer_idx}_r{rank}.f32.bin")
+    arr.tofile(path)
+    sha = hashlib.sha256(arr.tobytes()).hexdigest()
+    print(
+        f"[MTP-PRE-DUMP] {path} shape={tuple(arr.shape)} "
+        f"dtype={arr.dtype} sha16={sha[:16]}",
+        flush=True,
+    )
+
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -42,6 +71,533 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+# [E497-LN-XY-HASH] hash-only X/Y/dY/W for input_layernorm. Hook returns g.
+_E497_LN_CALLS: dict[str, int] = {}
+_E532_LN_DX_HITS: dict[str, int] = {}
+
+
+def _e497_ln_sha(t, *, t01: bool = False) -> str:
+    import hashlib
+
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose(0, 1)
+    x = x.contiguous()
+    if x.dtype == torch.bfloat16:
+        buf = x.view(torch.uint16).cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _e497_ln_record(x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    dump_dx = os.environ.get("MODEL_REPRO_LN_DX_DIR")
+    dump_mtpln = os.environ.get("MODEL_REPRO_MTPLN_HASH_DIR")
+    dump_fsln = os.environ.get("MODEL_REPRO_FSLN_HASH_DIR")
+    dump_bin = os.environ.get("MODEL_REPRO_FSLN_BIN_DIR")
+    if (not dump and not dump_dx and not dump_mtpln and not dump_fsln and not dump_bin) or y is None:
+        return
+    import json
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    key = f"ln|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_LN_CALLS[key] = _E497_LN_CALLS.get(key, 0) + 1
+    call = _E497_LN_CALLS[key]
+    rec = {
+        "kind": "fwd",
+        "tag": "ln",
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "sha_x": _e497_ln_sha(x),
+        "sha_x_t01": _e497_ln_sha(x, t01=True) if x.ndim == 3 else None,
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "sha_y": _e497_ln_sha(y),
+        "sha_y_t01": _e497_ln_sha(y, t01=True) if y.ndim == 3 else None,
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+        "sha_w": _e497_ln_sha(w) if w is not None else None,
+    }
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+        if not getattr(_e497_ln_record, "_announced", False):
+            print(f"[E497-LN-XY-HASH] dir={dump} rank={rank}", flush=True)
+            _e497_ln_record._announced = True
+        with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        def _on_dy(g, *, _dump=dump, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "ln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": _rank,
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "dtype_dy": str(g.dtype),
+                "sha_dy": _e497_ln_sha(g),
+                "sha_dy_t01": _e497_ln_sha(g, t01=True) if g.ndim == 3 else None,
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_dy)
+
+    # E-568: dump-off last-stage MTP transformer input_layernorm.
+    # Torch MTP LN is layer_number=1 with mtp flag often false; last-stage
+    # ranks 2/3 only (PP2). Decoder L1 on first-stage is ranks 0/1.
+    _is_mtp = bool(mtp) or (int(rec["layer"]) == 1 and int(rank) in (2, 3))
+    if dump_mtpln and _is_mtp:
+        os.makedirs(dump_mtpln, exist_ok=True)
+        if not getattr(_e497_ln_record, "_mtpln_announced", False):
+            print(f"[E568-MTPLN-HASH] dir={dump_mtpln} rank={rank}", flush=True)
+            _e497_ln_record._mtpln_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": "mtpln",
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": rec["sha_x"],
+            "sha_y": rec["sha_y"],
+        }
+        with open(os.path.join(dump_mtpln, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_mtpln_dy(g, *, _dump=dump_mtpln, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "mtpln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_ln_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_mtpln_dy)
+
+    # E-572: dump-off first-stage input_layernorm (fused 169-id consumer
+    # after SP scatter). Torch first-stage is mtp=0 ranks 0/1 (E-521;
+    # 1-indexed: L0=layer1, L1=layer2). Last-stage MTP also uses layer=1
+    # on ranks 2/3 — exclude those ranks so this is not a re-wrap of E-568.
+    # E-594 also dumps L1 on the same ranks. E-598 also dumps last-stage
+    # L2 (torch layer=3 ranks 2/3). E-602 also dumps last-stage L3
+    # (torch layer=4 ranks 2/3) so dump-off can bind L2.mlpbda.dY to L3.ln.dX.
+    _is_fsln = (not bool(mtp)) and (
+        int(rank) in (0, 1) or (int(rank) in (2, 3) and int(rec["layer"]) in (3, 4))
+    )
+    if dump_fsln and _is_fsln:
+        os.makedirs(dump_fsln, exist_ok=True)
+        if not getattr(_e497_ln_record, "_fsln_announced", False):
+            print(f"[E572-FSLN-HASH] dir={dump_fsln} rank={rank}", flush=True)
+            _e497_ln_record._fsln_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": "fsln",
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": rec["sha_x"],
+            "sha_y": rec["sha_y"],
+        }
+        with open(os.path.join(dump_fsln, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_fsln_dy(g, *, _dump=dump_fsln, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": "fsln",
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_ln_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_fsln_dy)
+
+        if x is not None and getattr(x, "requires_grad", False):
+
+            def _on_fsln_dx(g, *, _dump=dump_fsln, _rank=rank, _base=rec):
+                if g is None:
+                    return g
+                bwd = {
+                    "kind": "bwd_x",
+                    "tag": "fsln",
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "rank": int(_rank),
+                    "call": _base["call"],
+                    "shape_dx": list(g.shape),
+                    "sha_dx": _e497_ln_sha(g),
+                }
+                with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                return g
+
+            x.register_hook(_on_fsln_dx)
+
+    # E-613/E-621 dump-off: first-stage L0/L1 LN uint16 bins at SP-local seq=18.
+    # Torch L0=layer1, L1=layer2. Observation; no RMSNorm wrap.
+    if dump_bin and _is_fsln:
+        os.makedirs(dump_bin, exist_ok=True)
+        if not getattr(_e497_ln_record, "_e621_fsln_announced", False):
+            print(f"[E621-FSLN-BIN] dir={dump_bin} rank={rank} layer={rec['layer']}", flush=True)
+            _e497_ln_record._e621_fsln_announced = True
+        seq = int(x.shape[0]) if x is not None and getattr(x, "ndim", 0) >= 2 else 0
+        if seq == 18 and int(rec["layer"]) in (1, 2) and int(rank) in (0, 1):
+
+            def _e583_write_u16(stem, t, kind, *, _dump=dump_bin, _rank=rank, _base=rec, _call=call):
+                arr = t.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": kind,
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(t),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+
+            stem = f"torch_fsln_r{rank}_c{call}_L{rec['layer']}"
+            _e583_write_u16(f"{stem}_x", x, "x")
+            _e583_write_u16(f"{stem}_y", y, "y")
+            if w is not None:
+                _e583_write_u16(f"{stem}_w", w, "w")
+
+            def _on_fsln_bin_dy(g, *, _dump=dump_bin, _stem=stem, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dy",
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            if y.requires_grad:
+                y.register_hook(_on_fsln_bin_dy)
+
+            if x is not None and getattr(x, "requires_grad", False):
+
+                def _on_fsln_bin_dx(g, *, _dump=dump_bin, _stem=stem, _rank=rank, _base=rec, _call=call):
+                    if g is None:
+                        return g
+                    arr = g.detach().contiguous()
+                    u16 = arr.view(torch.uint16).cpu().numpy()
+                    u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                    meta = {
+                        "framework": "torch",
+                        "kind": "dx",
+                        "tag": "fsln",
+                        "rank": int(_rank),
+                        "layer": _base["layer"],
+                        "mtp": _base["mtp"],
+                        "call": int(_call),
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                        "sha": _e497_ln_sha(g),
+                        "suffix": "u16",
+                    }
+                    with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                        json.dump(meta, handle, sort_keys=True)
+                        handle.write("\n")
+                    return g
+
+                x.register_hook(_on_fsln_bin_dx)
+
+        # E-625/E-628 dump-off: last-stage L2/L3 LN uint16 bins at SP-local seq=18.
+        # Torch 1-indexed L2=layer 3, L3=layer 4, ranks 2/3. Observation; no RMSNorm wrap.
+        seq_ls = int(x.shape[0]) if x is not None and getattr(x, "ndim", 0) >= 2 else 0
+        if seq_ls == 18 and int(rec["layer"]) in (3, 4) and int(rank) in (2, 3):
+
+            def _e625_write_u16(stem, t, kind, *, _dump=dump_bin, _rank=rank, _base=rec, _call=call):
+                arr = t.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": kind,
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(t),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+
+            stem_ls = f"torch_fsln_r{rank}_c{call}_L{rec['layer']}"
+            if not getattr(_e497_ln_record, "_e628_lsl3_announced", False):
+                print(f"[E631-LSL3-BIN] dir={dump_bin} rank={rank} layer={rec['layer']}", flush=True)
+                _e497_ln_record._e628_lsl3_announced = True
+            _e625_write_u16(f"{stem_ls}_x", x, "x")
+            _e625_write_u16(f"{stem_ls}_y", y, "y")
+            if w is not None:
+                _e625_write_u16(f"{stem_ls}_w", w, "w")
+
+            def _on_lsl2_bin_dy(g, *, _dump=dump_bin, _stem=stem_ls, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dy",
+                    "tag": "fsln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            if y.requires_grad:
+                y.register_hook(_on_lsl2_bin_dy)
+            if x is not None and getattr(x, "requires_grad", False):
+
+                def _on_lsl2_bin_dx(g, *, _dump=dump_bin, _stem=stem_ls, _rank=rank, _base=rec, _call=call):
+                    if g is None:
+                        return g
+                    arr = g.detach().contiguous()
+                    u16 = arr.view(torch.uint16).cpu().numpy()
+                    u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                    meta = {
+                        "framework": "torch",
+                        "kind": "dx",
+                        "tag": "fsln",
+                        "rank": int(_rank),
+                        "layer": _base["layer"],
+                        "mtp": _base["mtp"],
+                        "call": int(_call),
+                        "shape": list(arr.shape),
+                        "dtype": str(arr.dtype),
+                        "sha": _e497_ln_sha(g),
+                        "suffix": "u16",
+                    }
+                    with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                        json.dump(meta, handle, sort_keys=True)
+                        handle.write("\n")
+                    return g
+
+                x.register_hook(_on_lsl2_bin_dx)
+
+    # E-637 dump-off: last-stage MTP transformer input_layernorm at seq=18.
+    # Independent of _is_fsln (that gate is `not mtp`, so E-636 never fired).
+    # Last-stage decoder is torch layer 3/4; MTP uses its own layer_number
+    # (not necessarily 1). Observation; no RMSNorm wrap.
+    seq_mtp = int(x.shape[0]) if x is not None and getattr(x, "ndim", 0) >= 2 else 0
+    # Last-stage ranks 2/3, seq=18. Prefer is_mtp_layer; else any LN that is
+    # not decoder L3/L4. Do not require layer==1.
+    _is_mtp_ln = int(rank) in (2, 3) and seq_mtp == 18 and (
+        bool(mtp) or int(rec["layer"]) not in (3, 4)
+    )
+    if dump_bin and _is_mtp_ln:
+
+        def _e637_write_u16(stem, t, kind, *, _dump=dump_bin, _rank=rank, _base=rec, _call=call):
+            arr = t.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": kind,
+                "tag": "mtpln",
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_ln_sha(t),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        if not getattr(_e497_ln_record, "_e637_mtpln_announced", False):
+            print(
+                f"[E637-MTPLN-BIN] dir={dump_bin} rank={rank} layer={rec['layer']} mtp={int(bool(mtp))}",
+                flush=True,
+            )
+            _e497_ln_record._e637_mtpln_announced = True
+        stem_m = f"torch_mtpln_r{rank}_c{call}_L{rec['layer']}"
+        _e637_write_u16(f"{stem_m}_x", x, "x")
+        _e637_write_u16(f"{stem_m}_y", y, "y")
+        if w is not None:
+            _e637_write_u16(f"{stem_m}_w", w, "w")
+
+        def _on_mtpln_bin_dy(g, *, _dump=dump_bin, _stem=stem_m, _rank=rank, _base=rec, _call=call):
+            if g is None:
+                return g
+            arr = g.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": "dy",
+                "tag": "mtpln",
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_ln_sha(g),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_mtpln_bin_dy)
+        if x is not None and getattr(x, "requires_grad", False):
+
+            def _on_mtpln_bin_dx(g, *, _dump=dump_bin, _stem=stem_m, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dx",
+                    "tag": "mtpln",
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_ln_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            x.register_hook(_on_mtpln_bin_dx)
+
+    # E-532 dump-only: live dX of L0 hidden_states (total incoming).
+    if dump_dx and x is not None and getattr(x, "requires_grad", False):
+
+        def _on_dx(g, *, _dump=dump_dx, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            # E-612: first-stage L0 (torch layer=1) SP-local seq=18
+            # (fused 36-token prefix after TP2/SP). Observation; return g.
+            if int(_base["mtp"]) != 0 or int(_base["layer"]) != 1:
+                return g
+            if int(_rank) not in (0, 1):
+                return g
+            seq = int(g.shape[0]) if g.ndim >= 2 else int(g.numel())
+            if seq != 18:
+                return g
+            import hashlib
+
+            os.makedirs(_dump, exist_ok=True)
+            hit_key = f"{_rank}|{_base['layer']}|{_base['mtp']}"
+            _E532_LN_DX_HITS[hit_key] = _E532_LN_DX_HITS.get(hit_key, 0) + 1
+            hit = _E532_LN_DX_HITS[hit_key]
+            dx = g.detach().cpu().float().numpy()
+            stem = (
+                f"torch_ln_dx_r{_rank}_L{_base['layer']}_m{_base['mtp']}"
+                f"_c{_base['call']}_h{hit}"
+            )
+            dx.tofile(os.path.join(_dump, f"{stem}.f32.bin"))
+            meta = {
+                "framework": "torch",
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": _base["call"],
+                "hit": int(hit),
+                "dx_shape": list(dx.shape),
+                "dx_sha256": hashlib.sha256(dx.tobytes()).hexdigest(),
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            print(
+                f"[E612-LN-DX-DUMP] r{_rank} L{_base['layer']} mtp={_base['mtp']} "
+                f"c={_base['call']} h={hit} shape={tuple(dx.shape)} "
+                f"sha={meta['dx_sha256'][:16]}",
+                flush=True,
+            )
+            return g
+
+        x.register_hook(_on_dx)
 
 
 def _get_offloading_interface():
@@ -354,6 +910,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        # DIAGNOSTIC env-gated capture hook (E-051R input/weight archival).
+        # Default off; no-op unless MODEL_REPRO_RMSNORM_ARCHIVE_DIR is set.
+        if os.environ.get("MODEL_REPRO_RMSNORM_ARCHIVE_DIR"):
+            try:
+                from model_repro_rmsnorm_capture import install as _repro_rmsnorm_install
+                _repro_rmsnorm_install(self)
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                import traceback as _tb
+                _tb.print_exc()
+                print(f"[rmsnorm-capture] install failed: {exc}")
 
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -377,6 +943,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             **attention_optional_kwargs,
             name=(name + ".self_attention") if name is not None else None,
         )
+        # E-638 dump-off: stamp MTP flag onto attention so oproj/qabs/vup/core
+        # records carry mtp=1. Observation only; does not change default path.
+        self.self_attention.is_mtp_layer = getattr(self, "is_mtp_layer", False)
+        # E-640: DSAttention is nested as core_attention; AbsorbedMLA.__init__
+        # runs before this stamp, so copy after the parent flag is set.
+        if hasattr(self.self_attention, "core_attention"):
+            self.self_attention.core_attention.is_mtp_layer = getattr(
+                self, "is_mtp_layer", False
+            )
 
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
@@ -436,6 +1011,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
+        else:
+            # Dense MLP has no set_layer_number (MoE-only). Stamp for dump-off
+            # first-stage L0 Linear+SwiGLU bins (E-593).
+            self.mlp.layer_number = self.layer_number
+            self.mlp.is_mtp_layer = getattr(self, "is_mtp_layer", False)
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
@@ -624,6 +1204,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+        ln_y = (
+            input_layernorm_output[0]
+            if isinstance(input_layernorm_output, tuple)
+            else input_layernorm_output
+        )
+        _e497_ln_record(
+            hidden_states,
+            ln_y,
+            getattr(self.input_layernorm, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
@@ -684,6 +1276,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _attn_y = (
+                attention_output_with_bias[0]
+                if isinstance(attention_output_with_bias, tuple)
+                else attention_output_with_bias
+            )
+            _e497_qa_record(
+                "bda",
+                _attn_y,
+                hidden_states,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
+            _e497_qa_record(
+                "res",
+                residual,
+                hidden_states,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
         nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -747,6 +1362,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        _nm_dump = os.environ.get("MODEL_REPRO_FORWARD_RECEIPT_DIR")
+        _nm_lay = getattr(self, "layer_number", None)
+        if _nm_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+            import torch.distributed as _nmd
+            _nmr = _nmd.get_rank() if _nmd.is_initialized() else 0
+            os.makedirs(_nm_dump, exist_ok=True)
+            hidden_states.detach().float().cpu().numpy().tofile(
+                os.path.join(_nm_dump, f"torch_premlp_norm_in_l{_nm_lay}_r{_nmr}.f32.bin")
+            )
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
@@ -756,7 +1380,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
 
+            _postn_y = (
+                pre_mlp_layernorm_output[0]
+                if isinstance(pre_mlp_layernorm_output, tuple)
+                else pre_mlp_layernorm_output
+            )
+            _e497_qa_record(
+                "postn",
+                hidden_states,
+                _postn_y,
+                getattr(self.pre_mlp_layernorm, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
+        if _nm_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+            pre_mlp_layernorm_output.detach().float().cpu().numpy().tofile(
+                os.path.join(_nm_dump, f"torch_premlp_norm_out_l{_nm_lay}_r{_nmr}.f32.bin")
+            )
         return pre_mlp_layernorm_output
 
     def _forward_mlp(
@@ -867,6 +1509,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = apply_module(self.mlp)(
                 pre_mlp_layernorm_output, padding_mask=padding_mask
             )
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _mlp_y = (
+                mlp_output_with_bias[0]
+                if isinstance(mlp_output_with_bias, tuple)
+                else mlp_output_with_bias
+            )
+            _e497_qa_record(
+                "mlp",
+                pre_mlp_layernorm_output
+                if not isinstance(pre_mlp_layernorm_output, tuple)
+                else pre_mlp_layernorm_output[0],
+                _mlp_y,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
         nvtx_range_pop(suffix="mlp")
 
@@ -926,6 +1585,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                     mlp_output_with_bias, residual, self.hidden_dropout
                 )
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _mlp_y = (
+                mlp_output_with_bias[0]
+                if isinstance(mlp_output_with_bias, tuple)
+                else mlp_output_with_bias
+            )
+            _e497_qa_record(
+                "mlpbda",
+                _mlp_y,
+                hidden_states,
+                None,
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
+            if os.environ.get("MODEL_REPRO_MTP_CONCAT_DUMP", "0") == "1":
+                _mtp_pre_dump_layer(hidden_states, "decoder_out", self.layer_number)
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.

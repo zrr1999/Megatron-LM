@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -249,6 +250,22 @@ class MLP(MegatronModule):
             name=(name + ".linear_fc2") if name is not None else None,
         )
 
+    def _e593_dense_record(self, tag, x, y, w):
+        # Dump-off first-stage L0 Linear+SwiGLU bins. Observation only.
+        dump = os.environ.get("MODEL_REPRO_FSRES_BIN_DIR")
+        if not dump or y is None:
+            return
+        from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+        _e497_qa_record(
+            tag,
+            x,
+            y,
+            w,
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
+
     def forward(
         self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
     ):
@@ -257,6 +274,45 @@ class MLP(MegatronModule):
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+        _fc1_dump = (
+            os.environ.get("MODEL_REPRO_LIVE_EXPERT_W_DUMP_DIR")
+            or os.environ.get("MODEL_REPRO_O1_VALID_DUMP_DIR")
+            or os.environ.get("MODEL_REPRO_FUSIONMOE_O1_DUMP_DIR")
+            or os.environ.get("MODEL_REPRO_FUSION_GEMM_DUMP_DIR")
+        )
+        if (
+            _fc1_dump
+            and getattr(self, "_is_expert_mlp", False)
+            and int(getattr(self, "layer_number", -1) or -1) == 4
+        ):
+            import hashlib as _hfc
+            import torch.distributed as _tdfc
+
+            _rank = _tdfc.get_rank() if _tdfc.is_initialized() else 0
+            _eidx = getattr(self, "_expert_index", -1)
+            _layer = getattr(self, "layer_number", -1)
+            if not hasattr(self, "_e680_fc1_dumped"):
+                self._e680_fc1_dumped = set()
+            _key = ("fc1y", int(_layer), int(_eidx), int(_rank))
+            if _key not in self._e680_fc1_dumped:
+                self._e680_fc1_dumped.add(_key)
+                os.makedirs(_fc1_dump, exist_ok=True)
+                _arr = intermediate_parallel.detach().float().cpu().numpy()
+                _path = os.path.join(
+                    _fc1_dump, f"torch_fc1y_e{_eidx}_l{_layer}_r{_rank}.f32.bin"
+                )
+                _arr.tofile(_path)
+                print(
+                    f"[LIVE-EXPERT-W-DUMP] {_path} shape={tuple(_arr.shape)} "
+                    f"dtype={_arr.dtype} sha16={_hfc.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                    flush=True,
+                )
+        self._e593_dense_record(
+            "mlpfc1",
+            hidden_states,
+            intermediate_parallel,
+            getattr(self.linear_fc1, "weight", None),
+        )
 
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:
@@ -320,6 +376,14 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
+                    if os.environ.get("MODEL_REPRO_MOE_GLU_EXPLICIT", "0") == "1":
+                        # E-183: fp32 explicit sigmoid to share libdevice expf
+                        g32 = x_glu.float()
+                        l32 = x_linear.float()
+                        s = g32 / (1.0 + torch.exp(-g32))
+                        return ((s * (l32 + self.config.glu_linear_offset))).to(
+                            x_glu.dtype
+                        )
                     return self.config.activation_func(x_glu) * (
                         x_linear + self.config.glu_linear_offset
                     )
@@ -328,12 +392,158 @@ class MLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+            _post_dump = os.environ.get("MODEL_REPRO_POST_FC1_DUMP_DIR") or os.environ.get(
+                "MODEL_REPRO_O2_DUMP_DIR"
+            )
+            if (
+                _post_dump
+                and getattr(self, "_is_expert_mlp", False)
+                and int(getattr(self, "layer_number", -1) or -1) == 4
+            ):
+                import hashlib as _hglu
+                import torch.distributed as _tdglu
+
+                _rank = _tdglu.get_rank() if _tdglu.is_initialized() else 0
+                _eidx = getattr(self, "_expert_index", -1)
+                _layer = getattr(self, "layer_number", -1)
+                if not hasattr(self, "_e681_glu_dumped"):
+                    self._e681_glu_dumped = set()
+                _key = ("glu", int(_layer), int(_eidx), int(_rank))
+                if _key not in self._e681_glu_dumped:
+                    self._e681_glu_dumped.add(_key)
+                    os.makedirs(_post_dump, exist_ok=True)
+                    _arr = intermediate_parallel.detach().float().cpu().numpy()
+                    _path = os.path.join(
+                        _post_dump, f"torch_glu_e{_eidx}_l{_layer}_r{_rank}.f32.bin"
+                    )
+                    _arr.tofile(_path)
+                    print(
+                        f"[POST-FC1-DUMP] {_path} shape={tuple(_arr.shape)} "
+                        f"dtype={_arr.dtype} sha16={_hglu.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                        flush=True,
+                    )
+
+            _glu_d = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+            if _glu_d and getattr(self, "_is_expert_mlp", False) and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                import torch.distributed as _glud
+                _glur = _glud.get_rank() if _glud.is_initialized() else 0
+                os.makedirs(_glu_d, exist_ok=True)
+                _glul = os.environ.get("MODEL_REPRO_CUR_LAYER", "x")
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(_glu_d, f"torch_gluout_l{_glul}_e{getattr(self, '_expert_index', 'x')}_r{_glur}.f32.bin")
+                )
+
+            _act_d = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _act_d and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and per_token_scale is not None:
+                import torch.distributed as _ad
+                _ark = _ad.get_rank() if _ad.is_initialized() else 0
+                os.makedirs(_act_d, exist_ok=True)
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(_act_d, f"torch_mlp_act_r{_ark}.f32.bin")
+                )
+
+            _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+            if (
+                _live
+                and getattr(self, "_is_expert_mlp", False)
+                and per_token_scale is not None
+            ):
+                import torch.distributed as _lxy
+
+                _lr = _lxy.get_rank() if _lxy.is_initialized() else 0
+                os.makedirs(_live, exist_ok=True)
+                _lay = str(getattr(self, "layer_number", "x"))
+                _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+                _eidx = getattr(self, "_expert_index", "x")
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _live, f"torch_x_l{_lay}_mtp{_mtp}_e{_eidx}_r{_lr}.f32.bin"
+                    )
+                )
+                per_token_scale.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _live, f"torch_p_l{_lay}_mtp{_mtp}_e{_eidx}_r{_lr}.f32.bin"
+                    )
+                )
+
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+                _post_dump = os.environ.get("MODEL_REPRO_POST_FC1_DUMP_DIR") or os.environ.get(
+                    "MODEL_REPRO_O2_DUMP_DIR"
+                )
+                if (
+                    _post_dump
+                    and getattr(self, "_is_expert_mlp", False)
+                    and int(getattr(self, "layer_number", -1) or -1) == 4
+                ):
+                    import hashlib as _hsc
+                    import torch.distributed as _tdsc
+
+                    _rank = _tdsc.get_rank() if _tdsc.is_initialized() else 0
+                    _eidx = getattr(self, "_expert_index", -1)
+                    _layer = getattr(self, "layer_number", -1)
+                    if not hasattr(self, "_e681_scaled_dumped"):
+                        self._e681_scaled_dumped = set()
+                    _key = ("scaled", int(_layer), int(_eidx), int(_rank))
+                    if _key not in self._e681_scaled_dumped:
+                        self._e681_scaled_dumped.add(_key)
+                        os.makedirs(_post_dump, exist_ok=True)
+                        _arr = intermediate_parallel.detach().float().cpu().numpy()
+                        _path = os.path.join(
+                            _post_dump, f"torch_scaled_e{_eidx}_l{_layer}_r{_rank}.f32.bin"
+                        )
+                        _arr.tofile(_path)
+                        print(
+                            f"[POST-FC1-DUMP] {_path} shape={tuple(_arr.shape)} "
+                            f"dtype={_arr.dtype} sha16={_hsc.sha256(_arr.tobytes()).hexdigest()[:16]}",
+                            flush=True,
+                        )
+                if _live and getattr(self, "_is_expert_mlp", False):
+                    import torch.distributed as _ldy
+
+                    _lr = _ldy.get_rank() if _ldy.is_initialized() else 0
+                    _lay = str(getattr(self, "layer_number", "x"))
+                    _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+                    _eidx = getattr(self, "_expert_index", "x")
+                    _dump = _live
+
+                    def _dump_dy(
+                        g,
+                        lay=_lay,
+                        mtp=_mtp,
+                        eidx=_eidx,
+                        r=_lr,
+                        d=_dump,
+                    ):
+                        if g is None:
+                            return
+                        g.detach().float().cpu().numpy().tofile(
+                            os.path.join(
+                                d, f"torch_dy_l{lay}_mtp{mtp}_e{eidx}_r{r}.f32.bin"
+                            )
+                        )
+
+                    intermediate_parallel.retain_grad()
+                    intermediate_parallel.register_hook(_dump_dy)
+                _act2 = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and not getattr(MLP, "_dbg_act", False):
+                    MLP._dbg_act = True
+                    print(f"[ACTDBG] is_expert={getattr(self, '_is_expert_mlp', None)} idx={getattr(self, '_expert_index', None)} act2={bool(_act2)}", flush=True)
+                if _act2 and getattr(self, "_is_expert_mlp", False) and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import torch.distributed as _actd2
+                    _actr2 = _actd2.get_rank() if _actd2.is_initialized() else 0
+                    os.makedirs(_act2, exist_ok=True)
+                    _lay = os.environ.get("MODEL_REPRO_CUR_LAYER", "x")
+                    intermediate_parallel.detach().float().cpu().numpy().tofile(
+                        os.path.join(_act2, f"torch_act_l{_lay}_e{getattr(self, '_expert_index', 'x')}_r{_actr2}.f32.bin")
+                    )
 
         nvtx_range_pop(suffix="activation")
+        self._e593_dense_record(
+            "mlpglu", intermediate_parallel, intermediate_parallel, None
+        )
 
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
@@ -342,6 +552,12 @@ class MLP(MegatronModule):
             cast(torch.Tensor, intermediate_parallel)
         )
         nvtx_range_pop(suffix="linear_fc2")
+        self._e593_dense_record(
+            "mlpfc2",
+            intermediate_parallel,
+            output,
+            getattr(self.linear_fc2, "weight", None),
+        )
 
         if per_token_scale is not None and output_bias is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly

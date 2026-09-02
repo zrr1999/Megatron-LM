@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -46,6 +47,521 @@ from megatron.core.utils import (
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+# [E497-QA-XY-HASH] hash-only X/Y/dY/W for q_down/kv_down. Hook returns g.
+_E497_QA_CALLS: dict[str, int] = {}
+
+
+def _e497_qa_sha(t, *, t01: bool = False, t2d: bool = False) -> str:
+    import hashlib
+
+    x = t.detach()
+    if t01 and x.ndim == 3:
+        x = x.transpose(0, 1)
+    elif t01 and x.ndim == 4:
+        x = x.transpose(0, 1)
+    elif t2d and x.ndim == 2:
+        x = x.transpose(0, 1)
+    x = x.contiguous()
+    if x.dtype == torch.bfloat16:
+        buf = x.view(torch.uint16).cpu().numpy().tobytes()
+    else:
+        buf = x.cpu().numpy().tobytes()
+    return hashlib.sha256(buf).hexdigest()
+
+
+def _e537_dump_oproj_bin(tag, kind, tensor, rec, rank, dump):
+    """CPU dump of last-stage call-5 oproj/core operands. Observation only."""
+    if tag not in ("oproj", "core") or tensor is None:
+        return
+    if int(rec.get("mtp") or 0) != 0 or int(rec.get("call") or 0) != 5:
+        return
+    if int(rec.get("layer") if rec.get("layer") is not None else -1) != 4:
+        return
+    if int(rank) not in (2, 3):
+        return
+    import json
+
+    x = tensor.detach().contiguous()
+    if x.dtype == torch.bfloat16:
+        buf = x.view(torch.uint16).cpu().numpy()
+        suffix = "bf16"
+    else:
+        buf = x.float().cpu().numpy()
+        suffix = "f32"
+    os.makedirs(dump, exist_ok=True)
+    stem = f"torch_{tag}_r{rank}_c{rec['call']}_L{rec['layer']}_{kind}"
+    buf.tofile(os.path.join(dump, f"{stem}.{suffix}.bin"))
+    meta = {
+        "framework": "torch",
+        "tag": tag,
+        "kind": kind,
+        "rank": int(rank),
+        "call": int(rec["call"]),
+        "layer": int(rec["layer"]),
+        "mtp": int(rec["mtp"]),
+        "shape": list(x.shape),
+        "dtype": str(x.dtype),
+        "suffix": suffix,
+        "nbytes": int(buf.nbytes),
+    }
+    with open(os.path.join(dump, f"{stem}.json"), "w", encoding="utf-8") as stream:
+        json.dump(meta, stream, sort_keys=True)
+        stream.write("\n")
+    if not getattr(_e537_dump_oproj_bin, "_announced", False):
+        print(f"[E537-OPROJ-BIN] dir={dump} rank={rank} {stem}", flush=True)
+        _e537_dump_oproj_bin._announced = True
+
+
+def _e497_qa_record(tag, x, y, w, layer, mtp) -> None:
+    dump = os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+    bindump = os.environ.get("MODEL_REPRO_OPROJ_BIN_DIR")
+    dump_mtpbda = os.environ.get("MODEL_REPRO_MTPBDA_HASH_DIR")
+    dump_mtpout = os.environ.get("MODEL_REPRO_MTPOUT_HASH_DIR")
+    dump_fsres = os.environ.get("MODEL_REPRO_FSRES_BIN_DIR")
+    if (not dump and not bindump and not dump_mtpbda and not dump_mtpout and not dump_fsres) or y is None:
+        return
+    import json
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    key = f"{tag}|{layer}|{int(bool(mtp))}|{rank}"
+    _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+    call = _E497_QA_CALLS[key]
+    if dump:
+        os.makedirs(dump, exist_ok=True)
+    if not getattr(_e497_qa_record, "_announced", False):
+        print(f"[E497-QA-XY-HASH] dir={dump} bindump={bindump} rank={rank}", flush=True)
+        _e497_qa_record._announced = True
+    rec = {
+        "kind": "fwd",
+        "tag": tag,
+        "layer": int(layer) if layer is not None else -1,
+        "mtp": int(bool(mtp)),
+        "rank": int(rank),
+        "call": int(call),
+        "shape_x": list(x.shape),
+        "dtype_x": str(x.dtype),
+        "shape_y": list(y.shape),
+        "dtype_y": str(y.dtype),
+        "shape_w": list(w.shape) if w is not None else None,
+        "dtype_w": str(w.dtype) if w is not None else None,
+    }
+    if dump:
+        rec["sha_x"] = _e497_qa_sha(x)
+        rec["sha_x_t01"] = _e497_qa_sha(x, t01=True) if x.ndim in (3, 4) else None
+        rec["sha_y"] = _e497_qa_sha(y)
+        rec["sha_y_t01"] = _e497_qa_sha(y, t01=True) if y.ndim in (3, 4) else None
+        rec["sha_w"] = _e497_qa_sha(w) if w is not None else None
+        rec["sha_w_T"] = (
+            _e497_qa_sha(w, t2d=True) if w is not None and w.ndim == 2 else None
+        )
+        rec["sha_w_bf16"] = (
+            _e497_qa_sha(w.detach().to(torch.bfloat16)) if w is not None else None
+        )
+        with open(os.path.join(dump, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    if bindump:
+        _e537_dump_oproj_bin(tag, "x", x, rec, rank, bindump)
+        _e537_dump_oproj_bin(tag, "y", y, rec, rank, bindump)
+        if w is not None:
+            _e537_dump_oproj_bin(tag, "w", w, rec, rank, bindump)
+
+    def _on_dy(g, *, _dump=dump, _bindump=bindump, _rank=rank, _base=rec):
+        if g is None:
+            return g
+        bwd = {
+            "kind": "bwd",
+            "tag": _base["tag"],
+            "layer": _base["layer"],
+            "mtp": _base["mtp"],
+            "rank": _rank,
+            "call": _base["call"],
+            "shape_dy": list(g.shape),
+            "dtype_dy": str(g.dtype),
+        }
+        if _dump:
+            bwd["sha_dy"] = _e497_qa_sha(g)
+            bwd["sha_dy_t01"] = (
+                _e497_qa_sha(g, t01=True) if g.ndim in (3, 4) else None
+            )
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+        if _bindump:
+            _e537_dump_oproj_bin(_base["tag"], "dy", g, _base, _rank, _bindump)
+        return g
+
+    if y.requires_grad:
+        y.register_hook(_on_dy)
+
+    # E-569: dump-off MTP transformer post-LN bda (attn residual) vs mlp.
+    # Torch MTP often records mtp=0 layer=1 on last-stage ranks 2/3.
+    _is_mtp = bool(mtp) or (int(rec["layer"]) == 1 and int(rank) in (2, 3))
+    if dump_mtpbda and _is_mtp and tag in ("bda", "mlp", "postn", "mlpbda"):
+        os.makedirs(dump_mtpbda, exist_ok=True)
+        if not getattr(_e497_qa_record, "_mtpbda_announced", False):
+            print(f"[E569-MTPBDA-HASH] dir={dump_mtpbda} rank={rank} tag={tag}", flush=True)
+            _e497_qa_record._mtpbda_announced = True
+        slim = {
+            "kind": "fwd",
+            "tag": tag,
+            "layer": rec["layer"],
+            "mtp": rec["mtp"],
+            "rank": int(rank),
+            "call": rec["call"],
+            "shape_x": rec["shape_x"],
+            "shape_y": rec["shape_y"],
+            "sha_x": _e497_qa_sha(x),
+            "sha_y": _e497_qa_sha(y),
+        }
+        with open(os.path.join(dump_mtpbda, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(slim, ensure_ascii=False) + "\n")
+
+        def _on_mtpbda_dy(g, *, _dump=dump_mtpbda, _rank=rank, _base=rec):
+            if g is None:
+                return g
+            bwd = {
+                "kind": "bwd",
+                "tag": _base["tag"],
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "rank": int(_rank),
+                "call": _base["call"],
+                "shape_dy": list(g.shape),
+                "sha_dy": _e497_qa_sha(g),
+            }
+            with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_mtpbda_dy)
+
+    # E-584/E-585: dump-off first-stage L0 residual skip / oproj / bda
+    # call-5 uint16 bins. Torch first-stage L0 is layer=1 mtp=0 ranks 0/1.
+    _is_fsres = (
+        tag
+        in (
+            "res",
+            "oproj",
+            "bda",
+            "core",
+            "qabs",
+            "vup",
+            "postn",
+            "mlp",
+            "mlpbda",
+            "moeprobs",
+            "moerouted",
+            "moeshared",
+            "mlpfc1",
+            "mlpglu",
+            "mlpfc2",
+        )
+        and (not bool(mtp))
+        and (
+            int(rank) in (0, 1)
+            or (int(rank) in (2, 3) and int(rec["layer"]) == 3)
+            or (
+                int(rank) in (2, 3)
+                and int(rec["layer"]) == 4
+                and tag in ("res", "oproj", "postn", "mlpbda", "core", "qabs", "vup")
+            )
+        )
+    )
+    ntok = 0
+    for t in (y, x):
+        if t is None or getattr(t, "ndim", 0) < 2:
+            continue
+        if int(t.shape[-1]) == 6144:
+            ntok = int(t.numel() // 6144)
+            break
+        if int(t.shape[0]) in (18, 36):
+            ntok = int(t.shape[0])
+            break
+        if int(t.shape[-1]) == 8192:
+            ntok = int(t.numel() // 8192)
+            break
+        if int(t.shape[-1]) == 12288:
+            ntok = int(t.numel() // 12288)
+            break
+    if ntok not in (18, 36):
+        for t in (y, x):
+            if t is None:
+                continue
+            for dim in getattr(t, "shape", ()):
+                if int(dim) in (18, 36):
+                    ntok = int(dim)
+                    break
+            if ntok in (18, 36):
+                break
+    if (
+        dump_fsres
+        and tag in ("res", "oproj", "bda", "core", "qabs", "vup", "postn", "mlp", "mlpbda", "mlpfc1", "mlpglu", "mlpfc2")
+        and (not bool(mtp))
+        and ntok in (18, 36)
+        and (
+            (int(rec["layer"]) in (1, 2) and int(rank) in (0, 1))
+            or (int(rec["layer"]) == 3 and int(rank) in (2, 3))
+            or (
+                int(rec["layer"]) == 4
+                and int(rank) in (2, 3)
+                and tag in ("res", "oproj", "bda", "core", "qabs", "vup", "postn", "mlpbda")
+            )
+        )
+    ):
+        os.makedirs(dump_fsres, exist_ok=True)
+        if not getattr(_e497_qa_record, "_e621_fsres_announced", False):
+            print(f"[E631-FSRES-BIN] dir={dump_fsres} rank={rank} tag={tag} layer={rec['layer']}", flush=True)
+            _e497_qa_record._e621_fsres_announced = True
+
+        def _e584_write_u16(stem, t, kind, *, _dump=dump_fsres, _rank=rank, _base=rec, _call=call):
+            arr = t.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": kind,
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(t),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        stem = f"torch_{tag}_r{rank}_c{call}_L{rec['layer']}"
+        _e584_write_u16(f"{stem}_x", x, "x")
+        _e584_write_u16(f"{stem}_y", y, "y")
+        if w is not None and tag in ("oproj", "qabs", "vup", "postn", "mlpfc1", "mlpfc2"):
+            _e584_write_u16(f"{stem}_w", w, "w")
+
+        def _on_fsres_dy(g, *, _dump=dump_fsres, _stem=stem, _rank=rank, _base=rec, _call=call):
+            if g is None:
+                return g
+            arr = g.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": "dy",
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(g),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            return g
+
+        if y.requires_grad:
+            y.register_hook(_on_fsres_dy)
+        if x is not None and getattr(x, "requires_grad", False):
+
+            def _on_fsres_dx(g, *, _dump=dump_fsres, _stem=stem, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dx",
+                    "tag": _base["tag"],
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_qa_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            x.register_hook(_on_fsres_dx)
+
+    # E-637 dump-off: last-stage MTP post-attn residual / o_proj / first attn
+    # at seq=18. Decoder FSRES above is `not mtp`. Skip mlp.Y (empty storage).
+    # E-643: also dump MTP postn / mlpbda (still skip mlp.Y).
+    # E-644: MTP mlp X/dX/dY plus moerouted/moeshared (still skip mlp.Y).
+    if (
+        dump_fsres
+        and bool(mtp)
+        and tag
+        in (
+            "res",
+            "oproj",
+            "bda",
+            "core",
+            "qabs",
+            "vup",
+            "postn",
+            "mlpbda",
+            "mlp",
+            "moerouted",
+            "moeshared",
+            "moeperm",
+            "moegemm",
+            "moeunperm",
+            "moeroute",
+            "moelogits",
+        )
+        and (
+            ntok in (18, 36)
+            or tag in ("moeperm", "moegemm", "moeunperm", "moeroute", "moelogits")
+        )
+        and int(rank) in (2, 3)
+        and (bool(mtp) or int(rec["layer"]) not in (3, 4))
+    ):
+        os.makedirs(dump_fsres, exist_ok=True)
+        if not getattr(_e497_qa_record, "_e637_mtpres_announced", False):
+            print(
+                f"[E649-MOELOGITS-BIN] dir={dump_fsres} rank={rank} tag={tag} layer={rec['layer']} mtp=1",
+                flush=True,
+            )
+            _e497_qa_record._e637_mtpres_announced = True
+
+        def _e637_write_u16(stem, t, kind, *, _dump=dump_fsres, _rank=rank, _base=rec, _call=call):
+            arr = t.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{stem}.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": kind,
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(t),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        stem_m = f"torch_{tag}_r{rank}_c{call}_L{rec['layer']}"
+
+        def _e649_write_f32(stem, t, kind, *, _dump=dump_fsres, _rank=rank, _base=rec, _call=call):
+            arr = t.detach().float().contiguous().cpu().numpy()
+            arr.tofile(os.path.join(_dump, f"{stem}.f32.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": kind,
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": "float32",
+                "sha": _e497_qa_sha(t),
+                "suffix": "f32",
+            }
+            with open(os.path.join(_dump, f"{stem}.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+
+        _e637_write_u16(f"{stem_m}_x", x, "x")
+        if tag == "moelogits":
+            _e649_write_f32(f"{stem_m}_y", y, "y")
+            if w is not None:
+                _e649_write_f32(f"{stem_m}_w", w, "w")
+        elif tag not in ("mlp", "moeroute"):
+            _e637_write_u16(f"{stem_m}_y", y, "y")
+        if w is not None and tag in ("oproj", "qabs", "vup"):
+            _e637_write_u16(f"{stem_m}_w", w, "w")
+
+        def _on_mtpres_dy(g, *, _dump=dump_fsres, _stem=stem_m, _rank=rank, _base=rec, _call=call):
+            if g is None:
+                return g
+            if tag == "moelogits":
+                arr = g.detach().float().contiguous().cpu().numpy()
+                arr.tofile(os.path.join(_dump, f"{_stem}_dy.f32.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dy",
+                    "tag": _base["tag"],
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": "float32",
+                    "sha": _e497_qa_sha(g),
+                    "suffix": "f32",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+            arr = g.detach().contiguous()
+            u16 = arr.view(torch.uint16).cpu().numpy()
+            u16.tofile(os.path.join(_dump, f"{_stem}_dy.u16.bin"))
+            meta = {
+                "framework": "torch",
+                "kind": "dy",
+                "tag": _base["tag"],
+                "rank": int(_rank),
+                "layer": _base["layer"],
+                "mtp": _base["mtp"],
+                "call": int(_call),
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha": _e497_qa_sha(g),
+                "suffix": "u16",
+            }
+            with open(os.path.join(_dump, f"{_stem}_dy.json"), "w", encoding="utf-8") as handle:
+                json.dump(meta, handle, sort_keys=True)
+                handle.write("\n")
+            return g
+
+        if tag != "moeroute" and y.requires_grad:
+            y.register_hook(_on_mtpres_dy)
+        if x is not None and getattr(x, "requires_grad", False):
+
+            def _on_mtpres_dx(g, *, _dump=dump_fsres, _stem=stem_m, _rank=rank, _base=rec, _call=call):
+                if g is None:
+                    return g
+                arr = g.detach().contiguous()
+                u16 = arr.view(torch.uint16).cpu().numpy()
+                u16.tofile(os.path.join(_dump, f"{_stem}_dx.u16.bin"))
+                meta = {
+                    "framework": "torch",
+                    "kind": "dx",
+                    "tag": _base["tag"],
+                    "rank": int(_rank),
+                    "layer": _base["layer"],
+                    "mtp": _base["mtp"],
+                    "call": int(_call),
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "sha": _e497_qa_sha(g),
+                    "suffix": "u16",
+                }
+                with open(os.path.join(_dump, f"{_stem}_dx.json"), "w", encoding="utf-8") as handle:
+                    json.dump(meta, handle, sort_keys=True)
+                    handle.write("\n")
+                return g
+
+            x.register_hook(_on_mtpres_dx)
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -215,6 +731,8 @@ class MultiLatentAttention(Attention):
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
         )
+        # E-640 dump-off: stamp MTP flag onto DSAttention. Observation only.
+        self.core_attention.is_mtp_layer = getattr(self, "is_mtp_layer", False)
 
         # Output.
         self.linear_proj = submodules.linear_proj(
@@ -631,6 +1149,14 @@ class MLASelfAttention(MultiLatentAttention):
             # elif linear_q_down_proj is Linear:
             #     q_compressed: [s / TP, b, q_lora_rank]
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
+            _e497_qa_record(
+                "qa",
+                hidden_states,
+                q_compressed,
+                getattr(self.linear_q_down_proj, "weight", None),
+                getattr(self, "layer_number", -1),
+                getattr(self, "is_mtp_layer", False),
+            )
 
             # When output is sharded (ColumnParallelLinear), two things are needed to be
             # identical to a normal Linear.
@@ -649,6 +1175,14 @@ class MLASelfAttention(MultiLatentAttention):
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        _e497_qa_record(
+            "kva",
+            hidden_states,
+            kv_combined,
+            getattr(self.linear_kv_down_proj, "weight", None),
+            getattr(self, "layer_number", -1),
+            getattr(self, "is_mtp_layer", False),
+        )
         return q_compressed, kv_combined
 
     def get_query_key_value_tensors(

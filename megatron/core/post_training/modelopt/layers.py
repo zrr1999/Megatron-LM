@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Callable, List, Optional, cast
 
 import torch
@@ -187,7 +188,24 @@ class Linear(torch.nn.Linear):
     def forward(self, x):
         """Forward."""
         out = super().forward(x)
+        # [E497-QA-XY-HASH] replicated MLA down-projections: in=6144, out=2048/576.
+        # Indexer linear_wq_b is also out=2048 but in=2048; skip it.
+        if (
+            os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR")
+            and self.in_features == 6144
+            and self.out_features in (2048, 576)
+        ):
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
 
+            tag = "qa" if self.out_features == 2048 else "kva"
+            _e497_qa_record(
+                tag,
+                x,
+                out,
+                self.weight,
+                getattr(self, "layer_number", -1),
+                False,
+            )
         if self._return_bias:
             return out
         return out, None

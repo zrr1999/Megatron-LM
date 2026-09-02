@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Literal, Optional
+import os
 
 import torch
 from torch import Tensor
@@ -137,6 +138,55 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
+            # E-573 dump-off: embedding output after fused lookup / transpose,
+            # before SP scatter (torch has no extra-token concat-slice).
+            dump_slice = os.environ.get("MODEL_REPRO_SLICE_HASH_DIR")
+            if dump_slice:
+                import json
+                from megatron.core.transformer.multi_latent_attention import (
+                    _E497_QA_CALLS,
+                    _e497_qa_sha,
+                )
+
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                key = f"slice|{rank}"
+                _E497_QA_CALLS[key] = _E497_QA_CALLS.get(key, 0) + 1
+                call = _E497_QA_CALLS[key]
+                os.makedirs(dump_slice, exist_ok=True)
+                rec = {
+                    "kind": "fwd",
+                    "tag": "slice",
+                    "rank": int(rank),
+                    "call": int(call),
+                    "shape_y": list(embeddings.shape),
+                    "sha_y": _e497_qa_sha(embeddings),
+                    "sha_y_t01": _e497_qa_sha(embeddings, t01=True) if embeddings.ndim == 3 else None,
+                    "extra_n": 0,
+                }
+                with open(os.path.join(dump_slice, f"rank{rank}.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                if not getattr(self, "_e573_slice_announced", False):
+                    print(f"[E573-SLICE-HASH] dir={dump_slice} rank={rank} call={call}", flush=True)
+                    self._e573_slice_announced = True
+
+                def _on_slice_hash(g, *, _dump=dump_slice, _rank=rank, _call=call):
+                    if g is None:
+                        return g
+                    bwd = {
+                        "kind": "bwd",
+                        "tag": "slice",
+                        "rank": int(_rank),
+                        "call": int(_call),
+                        "shape_dy": list(g.shape),
+                        "sha_dy": _e497_qa_sha(g),
+                        "sha_dy_t01": _e497_qa_sha(g, t01=True) if g.ndim == 3 else None,
+                    }
+                    with open(os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(bwd, ensure_ascii=False) + "\n")
+                    return g
+
+                if embeddings.requires_grad:
+                    embeddings.register_hook(_on_slice_hash)
             if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
                 embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
                     embeddings, group=self.tp_group

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -748,9 +749,62 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # E-544: Y-only hash of last-stage lm_head input (= fln.Y on paddle).
+        # transformer_block.final_layernorm does not fire on this MTP graph
+        # (E-521/E-538 torch jsonl never had tag=fln). No W, no bwd hook.
+        if os.environ.get("MODEL_REPRO_FLN_Y_HASH_DIR"):
+            from megatron.core.transformer.multi_latent_attention import (
+                _E497_QA_CALLS,
+                _e497_qa_sha,
+            )
+            import json
+
+            _dump = os.environ["MODEL_REPRO_FLN_Y_HASH_DIR"]
+            _rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            _key = f"flny|-1|0|{_rank}"
+            _E497_QA_CALLS[_key] = _E497_QA_CALLS.get(_key, 0) + 1
+            _call = _E497_QA_CALLS[_key]
+            os.makedirs(_dump, exist_ok=True)
+            _rec = {
+                "kind": "fwd",
+                "tag": "fln",
+                "layer": -1,
+                "mtp": 0,
+                "rank": int(_rank),
+                "call": int(_call),
+                "shape_y": list(hidden_states.shape),
+                "dtype_y": str(hidden_states.dtype),
+                "sha_y": _e497_qa_sha(hidden_states),
+            }
+            with open(
+                os.path.join(_dump, f"rank{_rank}.jsonl"), "a", encoding="utf-8"
+            ) as stream:
+                stream.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+            if not getattr(self, "_e544_flny_announced", False):
+                print(
+                    f"[E544-FLN-Y-HASH] dir={_dump} rank={_rank} call={_call}",
+                    flush=True,
+                )
+                self._e544_flny_announced = True
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+        # E-538: hash-only main lm_head X/Y/dY.
+        if os.environ.get("MODEL_REPRO_QA_XY_HASH_DIR"):
+            from megatron.core.transformer.multi_latent_attention import _e497_qa_record
+
+            _e497_qa_record(
+                "lmh",
+                hidden_states,
+                logits,
+                getattr(self.output_layer, "weight", None),
+                -1,
+                False,
+            )
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
