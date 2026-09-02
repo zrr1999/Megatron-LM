@@ -1558,6 +1558,22 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        # E-764: UAC Flex DeepEP token_dispatch uses paddle-live sync
+        # (async_finish=False allocate_on_comm_stream=False). Torch Flex
+        # defaults True/True; paddle live fused_dispatch stays False/False
+        # because E-734 async_finish=True LossNan and E-752
+        # allocate_on_comm_stream=True assert. Not paddle
+        # dispatch/routing/layout/clone (E-746-E-763). Needle has no
+        # comma (E-690 fail-closed).
+        if os.environ.get("USE_ACCURACY_COMPATIBLE", "0") == "1":
+            async_finish = False
+            allocate_on_comm_stream = False
+            if not getattr(self, "_e764_flex_sync_dispatch_logged", False):
+                self._e764_flex_sync_dispatch_logged = True
+                print(
+                    "E-764: UAC Flex DeepEP token_dispatch uses paddle-live sync async_finish=False allocate_on_comm_stream=False",
+                    flush=True,
+                )
         dispatched_hidden_states = self._comm_manager.dispatch(
             hidden_states, async_finish, allocate_on_comm_stream
         )
@@ -1617,6 +1633,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
+        # E-764: UAC Flex DeepEP token_combine uses paddle-live sync
+        # (async_finish=False allocate_on_comm_stream=False). Pair with
+        # token_dispatch so combine does not keep True/True while
+        # dispatch is sync. Not fused_combine wrap on paddle. Needle
+        # has no comma (E-690 fail-closed).
+        if os.environ.get("USE_ACCURACY_COMPATIBLE", "0") == "1":
+            async_finish = False
+            allocate_on_comm_stream = False
+            if not getattr(self, "_e764_flex_sync_combine_logged", False):
+                self._e764_flex_sync_combine_logged = True
+                print(
+                    "E-764: UAC Flex DeepEP token_combine uses paddle-live sync async_finish=False allocate_on_comm_stream=False",
+                    flush=True,
+                )
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
