@@ -358,6 +358,44 @@ def _update_router_expert_bias(
         return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+    _dump_dir = os.environ.get("MODEL_REPRO_EXPERT_BIAS_DUMP_DIR")
+    if _dump_dir:
+        import hashlib as _hashlib
+        import json as _json
+
+        from ..transformer.module import _use_accuracy_compatible as _uac_fn
+
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        _step = int(os.environ.get("MODEL_REPRO_STEP", "1"))
+        os.makedirs(_dump_dir, exist_ok=True)
+        _tok = stacked_tokens_per_expert.detach().to(torch.float32).cpu().numpy()
+        _bias0 = stacked_expert_bias.detach().to(torch.float32).cpu().numpy()
+        _payload = {
+            "schema": "glm52-expert-bias-dump/v1",
+            "framework": "torch",
+            "phase": "before_add",
+            "rank": _rank,
+            "step": _step,
+            "update_lr": float(config.moe_router_bias_update_rate),
+            "uac": bool(_uac_fn()),
+            "tokens": _tok.reshape(_tok.shape[0], -1).tolist(),
+            "bias": _bias0.reshape(_bias0.shape[0], -1).tolist(),
+            "bias_sha16": [
+                _hashlib.sha256(row.tobytes()).hexdigest()[:16] for row in _bias0.reshape(_bias0.shape[0], -1)
+            ],
+        }
+        with open(
+            os.path.join(_dump_dir, f"rank{_rank}_step{_step}_before.json"),
+            "w",
+            encoding="utf-8",
+        ) as _fh:
+            _json.dump(_payload, _fh, indent=2)
+            _fh.write("\n")
+        print(
+            f"[EXPERT-BIAS-DUMP] torch before rank={_rank} nlayers={len(expert_bias_list)} "
+            f"rate={config.moe_router_bias_update_rate} uac={_payload['uac']}",
+            flush=True,
+        )
     stacked_updated_expert_bias = get_updated_expert_bias(
         stacked_tokens_per_expert,
         stacked_expert_bias,
@@ -367,6 +405,33 @@ def _update_router_expert_bias(
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
         expert_bias.copy_(updated_expert_bias)
+    if _dump_dir:
+        _bias1 = torch.stack(expert_bias_list, dim=0).detach().to(torch.float32).cpu().numpy()
+        _tok1 = stacked_tokens_per_expert.detach().to(torch.float32).cpu().numpy()
+        with open(
+            os.path.join(_dump_dir, f"rank{_rank}_step{_step}_after.json"),
+            "w",
+            encoding="utf-8",
+        ) as _fh:
+            _json.dump(
+                {
+                    "schema": "glm52-expert-bias-dump/v1",
+                    "framework": "torch",
+                    "phase": "after_add",
+                    "rank": _rank,
+                    "step": _step,
+                    "tokens_after_allreduce": _tok1.reshape(_tok1.shape[0], -1).tolist(),
+                    "bias": _bias1.reshape(_bias1.shape[0], -1).tolist(),
+                    "bias_sha16": [
+                        _hashlib.sha256(row.tobytes()).hexdigest()[:16]
+                        for row in _bias1.reshape(_bias1.shape[0], -1)
+                    ],
+                },
+                _fh,
+                indent=2,
+            )
+            _fh.write("\n")
+        print(f"[EXPERT-BIAS-DUMP] torch after rank={_rank}", flush=True)
 
 
 def _allreduce_non_tensor_model_parallel_grads(
