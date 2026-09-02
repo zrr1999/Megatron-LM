@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -88,6 +89,18 @@ def _unfused_absorbed_dsa_fn(
     k = key.permute(1, 2, 3, 0)
     attention_scores = torch.matmul(q.float(), k.float()) * softmax_scale
 
+    import os as _os
+    _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+    if _dump_dir and not getattr(_unfused_absorbed_dsa_fn, "_dump_done", False):
+        _unfused_absorbed_dsa_fn._dump_done = True
+        import numpy as _np
+        attention_scores.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_scores.bin"))
+        topk_indices.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_topk.bin"))
+        query.detach().cpu().view(torch.int16).numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_q_scores.bin"))
+
     # Sparse + causal/varlen validity mask.
     index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
     dsa_masking.scatter_topk_into_index_mask(index_mask, topk_indices, seq_chunk_size=256)
@@ -99,8 +112,33 @@ def _unfused_absorbed_dsa_fn(
         key_positions=key_positions,
     )
 
+    if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_mask_done", False):
+        _unfused_absorbed_dsa_fn._dump_mask_done = True
+        index_mask.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, "torch_core_index_mask.bin"))
+
     attention_scores = attention_scores + index_mask.unsqueeze(1)
     valid_index_mask = torch.isfinite(index_mask).unsqueeze(1).expand(b, np, sq, skv)
+    _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+    if _live:
+        import torch.distributed as _td
+
+        _lr = _td.get_rank() if _td.is_initialized() else 0
+        os.makedirs(_live, exist_ok=True)
+        _lay = os.environ.get("MODEL_REPRO_DSA_LAYER", "-1")
+        _mtp = os.environ.get("MODEL_REPRO_DSA_MTP", "0")
+        attention_scores.detach().float().cpu().numpy().tofile(
+            os.path.join(_live, f"torch_dsascores_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+        )
+        valid_index_mask.detach().to(torch.uint8).cpu().numpy().tofile(
+            os.path.join(_live, f"torch_dsamask_l{_lay}_mtp{_mtp}_r{_lr}.u8.bin")
+        )
+        query.detach().float().cpu().numpy().tofile(
+            os.path.join(_live, f"torch_dsaq_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+        )
+        key.detach().float().cpu().numpy().tofile(
+            os.path.join(_live, f"torch_dsak_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+        )
     if accuracy_compatible:
         attention_scores = _AccuracyCompatibleSoftmax.apply(
             attention_scores.float(), valid_index_mask
@@ -109,9 +147,32 @@ def _unfused_absorbed_dsa_fn(
         attention_scores = dsa_masking.masked_softmax(
             attention_scores.float(), valid_index_mask, dim=-1
         )
+    if _live:
+
+        def _dump_dprobs(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+            if g is None:
+                return g
+            g.detach().float().cpu().numpy().tofile(
+                os.path.join(d, f"torch_ddsaprobs_l{lay}_mtp{mtp}_r{r}.f32.bin")
+            )
+            return g
+
+        attention_scores.detach().float().cpu().numpy().tofile(
+            os.path.join(_live, f"torch_dsaprobs_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+        )
+        if attention_scores.requires_grad:
+            attention_scores.register_hook(_dump_dprobs)
 
     # Latent value is the first v_channels slice of absorbed key cache.
     value = key[..., :v_channels].permute(1, 2, 0, 3)  # [b,1,skv,v]
+
+    _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+    if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_prob_done", False):
+        _unfused_absorbed_dsa_fn._dump_prob_done = True
+        import torch.distributed as _dist
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        attention_scores.detach().cpu().numpy().tofile(
+            _os.path.join(_dump_dir, f"torch_core_probs_r{_rank}.bin"))
     output = torch.matmul(attention_scores.to(value.dtype), value)  # [b,np,sq,v]
     return output.permute(2, 0, 1, 3).contiguous()
 
@@ -195,8 +256,71 @@ def _run_sparse_attention(
                 accuracy_compatible=accuracy_compatible,
             )
         assert output is not None
+        import os as _os
+        _dump_dir = _os.environ.get("MINI_DUMP_DIR")
+        if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_latent_done", False):
+            _unfused_absorbed_dsa_fn._dump_latent_done = True
+            import torch.distributed as _dist
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            output.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_core_latent_r{_rank}.bin"))
+        _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _live:
+            import torch.distributed as _td
+            from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+                _REPRO_KABSORB_STASH,
+            )
+
+            _lr = _td.get_rank() if _td.is_initialized() else 0
+            os.makedirs(_live, exist_ok=True)
+            _lay = int(os.environ.get("MODEL_REPRO_DSA_LAYER", "-1"))
+            _mtp = int(os.environ.get("MODEL_REPRO_DSA_MTP", "0"))
+            _stash = _REPRO_KABSORB_STASH.get((_lay, _mtp, _lr))
+            if _stash is not None:
+                _stash["q_nope"].detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_qnope_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+                )
+                _stash["k_up"].detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_kup_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+                )
+                _qabs = _stash.get("q_abs")
+                if _qabs is not None and getattr(_qabs, "requires_grad", False):
+
+                    def _dump_dqabs(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                        if g is None:
+                            return g
+                        g.detach().float().cpu().numpy().tofile(
+                            os.path.join(d, f"torch_dqabs_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                        )
+                        return g
+
+                    _qabs.register_hook(_dump_dqabs)
+            output.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_latent_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+            up_v_weight.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_vup_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+
+            def _dump_dlat(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                if g is None:
+                    return g
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_dlatent_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                )
+                return g
+
+            output.register_hook(_dump_dlat)
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
+        if _dump_dir and getattr(_unfused_absorbed_dsa_fn, "_dump_done", False) and not getattr(_unfused_absorbed_dsa_fn, "_dump_deabs_done", False):
+            _unfused_absorbed_dsa_fn._dump_deabs_done = True
+            import torch.distributed as _dist2
+            _rank2 = _dist2.get_rank() if _dist2.is_initialized() else 0
+            output.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_core_out_branch_r{_rank2}.bin"))
+            up_v_weight.detach().cpu().view(torch.int16).numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_up_v_weight_r{_rank2}.bin"))
         return output
 
     return unfused_dsa_fn(
@@ -2086,21 +2210,38 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
-        output = _run_sparse_attention(
-            absorbed_mla=absorbed_mla,
-            query=query,
-            key=key,
-            value=value,
-            up_v_weight=up_v_weight,
-            topk_indices=topk_indices,
-            topk_length=topk_length,
-            softmax_scale=self.softmax_scale,
-            config=self.config,
-            mask=float_mask,
-            varlen_starts=varlen_starts,
-            varlen_ends=varlen_ends,
-            key_positions=key_positions,
+        _prev_lay = os.environ.get("MODEL_REPRO_DSA_LAYER")
+        _prev_mtp = os.environ.get("MODEL_REPRO_DSA_MTP")
+        os.environ["MODEL_REPRO_DSA_LAYER"] = str(int(self.layer_number))
+        # PP stage-1 holds decoder layer 4 and MTP layer 1 (1-indexed).
+        os.environ["MODEL_REPRO_DSA_MTP"] = (
+            "1" if int(self.layer_number) == 1 else "0"
         )
+        try:
+            output = _run_sparse_attention(
+                absorbed_mla=absorbed_mla,
+                query=query,
+                key=key,
+                value=value,
+                up_v_weight=up_v_weight,
+                topk_indices=topk_indices,
+                topk_length=topk_length,
+                softmax_scale=self.softmax_scale,
+                config=self.config,
+                mask=float_mask,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=key_positions,
+            )
+        finally:
+            if _prev_lay is None:
+                os.environ.pop("MODEL_REPRO_DSA_LAYER", None)
+            else:
+                os.environ["MODEL_REPRO_DSA_LAYER"] = _prev_lay
+            if _prev_mtp is None:
+                os.environ.pop("MODEL_REPRO_DSA_MTP", None)
+            else:
+                os.environ["MODEL_REPRO_DSA_MTP"] = _prev_mtp
 
         if use_indexer_loss:
             if indexer_loss is None:

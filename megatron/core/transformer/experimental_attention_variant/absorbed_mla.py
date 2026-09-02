@@ -13,10 +13,21 @@ can be more efficient for certain attention variants.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
 import torch
+
+_dump_marker = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+if _dump_marker:
+    try:
+        os.makedirs(_dump_marker, exist_ok=True)
+        open(os.path.join(_dump_marker, "torch_absorbed_mla_imported.txt"), "a").write(
+            f"{os.getpid()} {__file__}\n"
+        )
+    except OSError:
+        pass
 
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -70,6 +81,56 @@ def _restore_packed_thd_batch_dim(
     ):
         core_attn_out = core_attn_out.unsqueeze(1)
     return core_attn_out
+
+
+# Process-wide stash so DSAttention (whose Python dumps already land) can
+# write q_nope / k_up / d(q_abs). Nested tofile inside AbsorbedMLA is dropped
+# when the module is compiled; this helper is compiler-disabled.
+_REPRO_KABSORB_STASH: dict = {}
+
+
+@torch.compiler.disable
+def _repro_kabsorb_dump_and_einsum(q_no_pe, k_up_weight):
+    """Eager K-absorb + dump. Matches live ``einsum(...nd,ndk->...nk)``."""
+    dump_dir = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+    q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight).contiguous()
+    if not dump_dir:
+        return q_absorbed
+    try:
+        import torch.distributed as _td
+
+        rank = _td.get_rank() if _td.is_initialized() else 0
+        os.makedirs(dump_dir, exist_ok=True)
+        lay = os.environ.get("MODEL_REPRO_DSA_LAYER", "-1")
+        mtp = os.environ.get("MODEL_REPRO_DSA_MTP", "0")
+        key = (int(lay), int(mtp), int(rank))
+        _REPRO_KABSORB_STASH[key] = {
+            "q_nope": q_no_pe.detach(),
+            "k_up": k_up_weight.detach(),
+            "q_abs": q_absorbed,
+        }
+        q_no_pe.detach().float().cpu().numpy().tofile(
+            os.path.join(dump_dir, f"torch_qnope_l{lay}_mtp{mtp}_r{rank}.f32.bin")
+        )
+        k_up_weight.detach().float().cpu().numpy().tofile(
+            os.path.join(dump_dir, f"torch_kup_l{lay}_mtp{mtp}_r{rank}.f32.bin")
+        )
+        with open(os.path.join(dump_dir, "torch_kabsorb_dump.txt"), "a") as fh:
+            fh.write(f"pid={os.getpid()} lay={lay} mtp={mtp} r={rank} q={tuple(q_no_pe.shape)} w={tuple(k_up_weight.shape)}\n")
+
+        def _dump_dqabs(g, lay=lay, mtp=mtp, r=rank, d=dump_dir):
+            if g is None:
+                return g
+            g.detach().float().cpu().numpy().tofile(
+                os.path.join(d, f"torch_dqabs_l{lay}_mtp{mtp}_r{r}.f32.bin")
+            )
+            return g
+
+        if q_absorbed.requires_grad:
+            q_absorbed.register_hook(_dump_dqabs)
+    except OSError:
+        pass
+    return q_absorbed
 
 
 def _apply_absorbed_v_up_projection(
@@ -319,6 +380,35 @@ class AbsorbedMLASelfAttention(Attention):
                 tp_group=pg_collection.tp,
                 name=(name + ".linear_q_up_proj") if name is not None else None,
             )
+            if os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR"):
+
+                def _dump_q_up(mod, inputs, output, layer=self):
+                    dump_dir = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+                    if not dump_dir:
+                        return
+                    q = output[0] if isinstance(output, (tuple, list)) else output
+                    if q is None:
+                        return
+                    import torch.distributed as _td
+
+                    rank = _td.get_rank() if _td.is_initialized() else 0
+                    os.makedirs(dump_dir, exist_ok=True)
+                    lay = int(getattr(layer, "layer_number", -1))
+                    mtp = os.environ.get("MODEL_REPRO_DSA_MTP", "0")
+                    q.detach().float().cpu().numpy().tofile(
+                        os.path.join(dump_dir, f"torch_qup_l{lay}_mtp{mtp}_r{rank}.f32.bin")
+                    )
+                    qk = int(layer.config.qk_head_dim)
+                    q_view = q.view(*q.size()[:-1], layer.num_attention_heads_per_partition, layer.q_head_dim)
+                    q_view[..., :qk].contiguous().detach().float().cpu().numpy().tofile(
+                        os.path.join(dump_dir, f"torch_qnope_l{lay}_mtp{mtp}_r{rank}.f32.bin")
+                    )
+                    k_up, _ = layer._get_kv_up_weights()
+                    k_up.detach().float().cpu().numpy().tofile(
+                        os.path.join(dump_dir, f"torch_kup_l{lay}_mtp{mtp}_r{rank}.f32.bin")
+                    )
+
+                self.linear_q_up_proj.register_forward_hook(_dump_q_up)
 
         kv_down_proj_kwargs = {}
         if submodules.linear_kv_down_proj in [TELinear]:
@@ -557,8 +647,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
+                q_absorbed = _repro_kabsorb_dump_and_einsum(q_no_pe, k_up_weight)
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
@@ -616,8 +705,7 @@ class AbsorbedMLASelfAttention(Attention):
 
                 # Absorb k_up_weight into q_no_pe
                 # q_absorbed: [num_tokens, n, kv_lora_rank]
-                q_absorbed = torch.einsum("...nd,ndk->...nk", q_no_pe, k_up_weight)
-                q_absorbed = q_absorbed.contiguous()
+                q_absorbed = _repro_kabsorb_dump_and_einsum(q_no_pe, k_up_weight)
                 assert q_absorbed.ndim == q.ndim
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
@@ -801,6 +889,10 @@ class AbsorbedMLASelfAttention(Attention):
         inference_params=None,
     ):
         """Forward pass for multi-latent attention with matrix absorption"""
+        os.environ["MODEL_REPRO_DSA_LAYER"] = str(int(self.layer_number))
+        os.environ["MODEL_REPRO_DSA_MTP"] = (
+            "1" if int(self.layer_number) == 1 else "0"
+        )
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
         assert (

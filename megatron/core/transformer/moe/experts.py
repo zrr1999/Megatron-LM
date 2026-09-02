@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
@@ -705,6 +706,14 @@ class TEGroupedMLP(MegatronModule):
             fc1_output, bias_parallel = apply_module(self.linear_fc1)(
                 permuted_local_hidden_states, tokens_per_expert
             )
+            _r1_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _r1_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                import torch.distributed as _pd1
+                _pr1 = _pd1.get_rank() if _pd1.is_initialized() else 0
+                os.makedirs(_r1_dump, exist_ok=True)
+                fc1_output.detach().float().cpu().numpy().tofile(
+                    os.path.join(_r1_dump, f"torch_fc1_raw_r{_pr1}.f32.bin")
+                )
         fc1_output = expert_fc1_manager.group_offload(
             fc1_output,
             forced_released_tensors=[permuted_local_hidden_states],
@@ -728,11 +737,27 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = self._remove_glu_interleaving(
                         intermediate_parallel, self.config.moe_mlp_glu_interleave_size
                     )
+                _raw_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                if _raw_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import torch.distributed as _pdv
+                    _pr = _pdv.get_rank() if _pdv.is_initialized() else 0
+                    os.makedirs(_raw_dump, exist_ok=True)
+                    intermediate_parallel.detach().float().cpu().numpy().tofile(
+                        os.path.join(_raw_dump, f"torch_fc1_raw_r{_pr}.f32.bin")
+                    )
                 intermediate_parallel = self.activation_func(intermediate_parallel)
                 if permuted_probs is not None:
                     original_dtype = intermediate_parallel.dtype
                     intermediate_parallel = intermediate_parallel * permuted_probs
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
+                    _act_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                    if _act_dump and os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+                        import torch.distributed as _ed
+                        _er = _ed.get_rank() if _ed.is_initialized() else 0
+                        os.makedirs(_act_dump, exist_ok=True)
+                        intermediate_parallel.detach().float().cpu().numpy().tofile(
+                            os.path.join(_act_dump, f"torch_act_probs_r{_er}.f32.bin")
+                        )
             elif self.config.bias_activation_fusion and not with_glu_interleaving:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
                     # dtype is handled inside the fused kernel
@@ -786,6 +811,14 @@ class TEGroupedMLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * permuted_probs
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+                _act_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                if _act_dump and os.environ.get("MODEL_REPRO_MOE_UNPERM_EXPERT_ORDER", "0") == "1":
+                    import torch.distributed as _ed
+                    _er = _ed.get_rank() if _ed.is_initialized() else 0
+                    os.makedirs(_act_dump, exist_ok=True)
+                    intermediate_parallel.detach().float().cpu().numpy().tofile(
+                        os.path.join(_act_dump, f"torch_act_probs_r{_er}.f32.bin")
+                    )
             return intermediate_parallel
 
         if self.activation_recompute:
@@ -1236,6 +1269,10 @@ class SequentialMLP(MegatronModule):
                 tp_group=pg_collection.expt_tp,
                 name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
+            expert._is_expert_mlp = True
+            expert._expert_index = expert_idx
+            expert.layer_number = getattr(self, "layer_number", None)
+            expert.is_mtp_layer = getattr(self, "is_mtp_layer", False)
             self.local_experts.append(expert)
 
         # ---- alignment patch: expose GroupedMLP-style interfaces on SequentialMLP ----
@@ -1348,13 +1385,27 @@ class SequentialMLP(MegatronModule):
 
             output_local_list = []
 
-            for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+            _smlp_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            for _eidx, (expert, tokens, probs) in enumerate(zip(self.local_experts, tokens_list, probs_list)):
                 if self.config.fp8 or self.config.fp4:
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:
                     output, output_bias = expert(tokens, probs)
+                if _smlp_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import torch.distributed as _sed
+                    _sek = _sed.get_rank() if _sed.is_initialized() else 0
+                    os.makedirs(_smlp_dump, exist_ok=True)
+                    tokens.detach().float().cpu().numpy().tofile(
+                        os.path.join(_smlp_dump, f"torch_fc1_in_e{_eidx}_r{_sek}.f32.bin")
+                    )
+                    probs.detach().float().cpu().numpy().tofile(
+                        os.path.join(_smlp_dump, f"torch_probs_e{_eidx}_r{_sek}.f32.bin")
+                    )
+                    output.detach().float().cpu().numpy().tofile(
+                        os.path.join(_smlp_dump, f"torch_expert_out_e{_eidx}_r{_sek}.f32.bin")
+                    )
                 output_local_list.append(output)
 
             output_local = torch.cat(output_local_list, dim=0)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -852,7 +853,32 @@ class MLASelfAttention(MultiLatentAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+            _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+            if _live:
+                import torch.distributed as _td
+
+                _lr = _td.get_rank() if _td.is_initialized() else 0
+                os.makedirs(_live, exist_ok=True)
+                _lay = getattr(self, "layer_number", "x")
+                _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+                kv_compressed.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_kvupx_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+                )
             kv, _ = self.linear_kv_up_proj(kv_compressed)
+            if _live:
+                kv.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_kvupy_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+                )
+
+                def _dump_kvup_dy(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                    if g is None:
+                        return g
+                    g.detach().float().cpu().numpy().tofile(
+                        os.path.join(d, f"torch_kvupdy_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                    )
+                    return g
+
+                kv.register_hook(_dump_kvup_dy)
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(

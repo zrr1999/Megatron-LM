@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -208,6 +209,13 @@ class BaseMoELayer(MegatronModule, ABC):
         """Set the layer number for the MoE layer."""
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
+        experts = getattr(self, "experts", None)
+        if experts is not None:
+            experts.layer_number = layer_number
+            experts.is_mtp_layer = getattr(self, "is_mtp_layer", False)
+            for expert in getattr(experts, "local_experts", []):
+                expert.layer_number = layer_number
+                expert.is_mtp_layer = getattr(self, "is_mtp_layer", False)
 
 
 class MoELayer(BaseMoELayer):
@@ -441,7 +449,46 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
+        _moed_in = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+        if _moed_in:
+            import torch.distributed as _md
+            _mrk = _md.get_rank() if _md.is_initialized() else 0
+            _ml2 = getattr(self, "layer_number", None)
+            os.makedirs(_moed_in, exist_ok=True)
+            hidden_states.detach().float().cpu().numpy().tofile(
+                os.path.join(_moed_in, f"torch_moe_input_l{_ml2}_r{_mrk}.f32.bin")
+            )
+        probs, routing_map = self.router(hidden_states, padding_mask)
+        import os as _os
+        _rout_in_dump = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+        if _rout_in_dump:
+            import torch.distributed as _rid
+            _rik = _rid.get_rank() if _rid.is_initialized() else 0
+            _rl = getattr(self, "layer_number", None)
+            os.makedirs(_rout_in_dump, exist_ok=True)
+            hidden_states.detach().float().cpu().numpy().tofile(
+                os.path.join(_rout_in_dump, f"torch_router_input_l{_rl}_r{_rik}.f32.bin")
+            )
+        import os as _os_new
+
+        _dump_dir = _os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+        if _dump_dir and not getattr(MoELayer.route, "_repro_router_dumped", False):
+            MoELayer.route._repro_router_dumped = True
+            import torch.distributed as _dist
+
+            _rank = _dist.get_rank() if _dist.is_initialized() else 0
+            _os.makedirs(_dump_dir, exist_ok=True)
+            probs.detach().float().cpu().numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_router_probs_r{_rank}.f32.bin")
+            )
+            routing_map.detach().to(torch.uint8).cpu().numpy().tofile(
+                _os.path.join(_dump_dir, f"torch_routing_map_r{_rank}.u8.bin")
+            )
+            with open(
+                _os.path.join(_dump_dir, f"torch_router_shapes_r{_rank}.txt"), "w"
+            ) as _f:
+                _f.write(f"probs={tuple(probs.shape)} dtype={probs.dtype}\n")
+                _f.write(f"routing_map={tuple(routing_map.shape)} dtype={routing_map.dtype}\n")
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -506,6 +553,26 @@ class MoELayer(BaseMoELayer):
         """
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
+            _m_si_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _m_si_dump:
+                import torch.distributed as _dist3
+
+                _sirank = _dist3.get_rank() if _dist3.is_initialized() else 0
+                os.makedirs(_m_si_dump, exist_ok=True)
+                hidden_states.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _m_si_dump,
+                        f"torch_shared_input_l{self.layer_number}_r{_sirank}.f32.bin",
+                    )
+                )
+                _se = apply_module(self.shared_experts)
+                for _n, _p in _se.named_parameters():
+                    _p.detach().float().cpu().numpy().tofile(
+                        os.path.join(
+                            _m_si_dump,
+                            f"torch_shared_param_{_n.replace('.', '_')}_l{self.layer_number}_r{_sirank}.f32.bin",
+                        )
+                    )
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
                 if self.config.fp8 or self.config.fp4:
@@ -540,15 +607,43 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _live and permuted_probs is not None:
+            import torch.distributed as _lxy
+
+            _lr = _lxy.get_rank() if _lxy.is_initialized() else 0
+            os.makedirs(_live, exist_ok=True)
+            _lay = getattr(self, "layer_number", "x")
+            _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+            permuted_probs.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_p_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+
+            def _dump_dp(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                if g is None:
+                    return
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_dp_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                )
+
+            permuted_probs.retain_grad()
+            permuted_probs.register_hook(_dump_dp)
         if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
-            expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
-            )
+            _cur_l = getattr(self, "layer_number", None)
+            _prev_l = os.environ.get("MODEL_REPRO_CUR_LAYER", "")
+            if _cur_l is not None:
+                os.environ["MODEL_REPRO_CUR_LAYER"] = str(_cur_l)
+            try:
+                expert_output, mlp_bias = apply_module(self.experts)(
+                    dispatched_input, tokens_per_expert, permuted_probs
+                )
+            finally:
+                os.environ["MODEL_REPRO_CUR_LAYER"] = _prev_l
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
@@ -576,6 +671,18 @@ class MoELayer(BaseMoELayer):
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
+            _moe_shared_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _moe_shared_dump:
+                import torch.distributed as _dist2
+
+                _srank = _dist2.get_rank() if _dist2.is_initialized() else 0
+                os.makedirs(_moe_shared_dump, exist_ok=True)
+                shared_expert_output.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _moe_shared_dump,
+                        f"torch_moe_shared_output_l{self.layer_number}_r{_srank}.f32.bin",
+                    )
+                )
             output = output + shared_expert_output
         elif (
             isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
@@ -681,12 +788,40 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
+                _di_pre = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+                if _di_pre:
+                    import torch.distributed as _dip
+                    _dipk = _dip.get_rank() if _dip.is_initialized() else 0
+                    _dipl = getattr(self, "layer_number", None)
+                    os.makedirs(_di_pre, exist_ok=True)
+                    hidden_states.detach().float().cpu().numpy().tofile(
+                        os.path.join(_di_pre, f"torch_dispatch_pre_l{_dipl}_r{_dipk}.f32.bin")
+                    )
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
+                _di_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                if _di_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import torch.distributed as _dipd
+                    _dirk = _dipd.get_rank() if _dipd.is_initialized() else 0
+                    os.makedirs(_di_dump, exist_ok=True)
+                    dispatched_input.detach().float().cpu().numpy().tofile(
+                        os.path.join(_di_dump, f"torch_dispatch_input_r{_dirk}.f32.bin")
+                    )
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                _moe_ds_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                if _moe_ds_dump:
+                    import torch.distributed as _dist
+                    _dsrank = _dist.get_rank() if _dist.is_initialized() else 0
+                    os.makedirs(_moe_ds_dump, exist_ok=True)
+                    output.detach().float().cpu().numpy().tofile(
+                        os.path.join(
+                            _moe_ds_dump,
+                            f"torch_moe_routed_output_l{self.layer_number}_r{_dsrank}.f32.bin",
+                        )
+                    )
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -696,6 +831,17 @@ class MoELayer(BaseMoELayer):
                     output, shared_expert_output = intermediate_tensors
 
                 output = self.postprocess(output, shared_expert_output)
+                _moe_ds_dump = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+                if _moe_ds_dump:
+                    import torch.distributed as _dist
+                    _dsrank = _dist.get_rank() if _dist.is_initialized() else 0
+                    os.makedirs(_moe_ds_dump, exist_ok=True)
+                    output.detach().float().cpu().numpy().tofile(
+                        os.path.join(
+                            _moe_ds_dump,
+                            f"torch_moe_final_output_l{self.layer_number}_s{os.environ.get('MODEL_REPRO_STEP', 'x')}_r{_dsrank}.f32.bin",
+                        )
+                    )
 
                 if intermediate_tensors is not None:
                     return output

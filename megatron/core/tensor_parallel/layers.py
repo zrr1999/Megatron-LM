@@ -6,6 +6,16 @@ from __future__ import annotations
 
 import os
 import warnings
+
+_e274_marker = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+if _e274_marker:
+    try:
+        os.makedirs(_e274_marker, exist_ok=True)
+        open(os.path.join(_e274_marker, "torch_layers_imported.txt"), "a").write(
+            f"{os.getpid()} {__file__}\n"
+        )
+    except OSError:
+        pass
 from functools import partial
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -517,6 +527,25 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @custom_bwd
     def backward(ctx, grad_output):
         """Backward."""
+        _live_early = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _live_early:
+            try:
+                os.makedirs(_live_early, exist_ok=True)
+                open(os.path.join(_live_early, "torch_lin_bwd_entered.txt"), "a").write(
+                    f"{os.getpid()} go={tuple(grad_output.shape)} dtype={grad_output.dtype}\n"
+                )
+                if int(grad_output.shape[-1]) in (7168, 14336, 512):
+                    import torch.distributed as _td
+
+                    _rank = _td.get_rank() if _td.is_initialized() else 0
+                    grad_output.detach().float().cpu().numpy().tofile(
+                        os.path.join(
+                            _live_early,
+                            f"torch_earlydy_go{int(grad_output.shape[-1])}_r{_rank}.f32.bin",
+                        )
+                    )
+            except OSError:
+                pass
         input, weight = ctx.saved_tensors
         main_grad = ctx.main_grad
         use_bias = ctx.use_bias
@@ -561,6 +590,23 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
                 grad_output, total_input
             )
+            _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+            _wshape = [int(x) for x in weight.shape]
+            if _live and total_input is not None and 512 in _wshape:
+                import torch.distributed as _td
+
+                _rank = _td.get_rank() if _td.is_initialized() else 0
+                os.makedirs(_live, exist_ok=True)
+                _tag = (
+                    f"s{int(total_input.shape[0])}_w"
+                    + "x".join(str(x) for x in _wshape)
+                )
+                total_input.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_linx_{_tag}_r{_rank}.f32.bin")
+                )
+                grad_output.detach().float().cpu().numpy().tofile(
+                    os.path.join(_live, f"torch_lindy_{_tag}_r{_rank}.f32.bin")
+                )
 
         if ctx.allreduce_dgrad:
             # Asynchronous all-reduce
@@ -777,6 +823,31 @@ def linear_with_grad_accumulation_and_async_allreduce(
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
+def _expert_grads_need_own_dp_domain(config) -> bool:
+    """Whether expert parameters must be reduced over the expert-data-parallel group.
+
+    mcore normally decides this from ``expert_model_parallel_size > 1`` alone, which
+    is correct only when the expert tensor-parallel size equals the dense one: the
+    expert parameter is then sharded exactly like a dense parameter and its
+    data-parallel domain coincides with ``dp_cp``.
+
+    With ``expert_tensor_parallel_size < tensor_model_parallel_size`` (the accuracy
+    -compatible topology uses ETP=1 with TP=2) every rank in the tensor-parallel
+    group holds a FULL copy of the expert weight while consuming only its own
+    sequence-parallel shard of the tokens. Those partial weight gradients live in a
+    larger data-parallel domain (``expt_dp`` = TP/ETP times ``dp_cp``) and must be
+    summed. Leaving ``allreduce=True`` puts them in the dense bucket, which is
+    reduced over ``dp_cp`` — size 1 in this topology — so the reduction silently
+    never happens and every expert gradient stays a per-rank partial sum.
+    """
+    if config.expert_model_parallel_size > 1:
+        return True
+    etp = getattr(config, 'expert_tensor_parallel_size', None)
+    if etp is None:
+        return False
+    return etp != config.tensor_model_parallel_size
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -921,7 +992,11 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.weight = None
 
@@ -943,7 +1018,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -1014,6 +1093,23 @@ class ColumnParallelLinear(torch.nn.Module):
             - bias
 
         """
+        _live_col = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        _buf = getattr(self, "tp_comm_buffer_name", None)
+        _dump_q_up = bool(_live_col) and (_buf == "q_up_proj")
+        _dump_kv512 = bool(_live_col) and self.input_size == 512
+        if _dump_kv512 or _dump_q_up:
+            import torch.distributed as _td
+
+            _rank = _td.get_rank() if _td.is_initialized() else 0
+            os.makedirs(_live_col, exist_ok=True)
+            _tag = (
+                f"n{_buf or 'na'}_"
+                f"in{int(input_.shape[0])}_w"
+                + "x".join(str(int(x)) for x in self.weight.shape)
+            )
+            input_.detach().float().cpu().numpy().tofile(
+                os.path.join(_live_col, f"torch_colx_{_tag}_r{_rank}.f32.bin")
+            )
         if weight is None:
             if self.weight is None:
                 raise RuntimeError(
@@ -1099,6 +1195,35 @@ class ColumnParallelLinear(torch.nn.Module):
                 )
         else:
             output = output_parallel
+        if _dump_kv512 or _dump_q_up:
+            output.detach().float().cpu().numpy().tofile(
+                os.path.join(_live_col, f"torch_coly_{_tag}_r{_rank}.f32.bin")
+            )
+            if _dump_q_up:
+                # q_up output is [tokens, n*(qk+rope)]; first qk_head_dim=192 is q_nope.
+                _lay = os.environ.get("MODEL_REPRO_DSA_LAYER", "-1")
+                _mtp = os.environ.get("MODEL_REPRO_DSA_MTP", "0")
+                _q = output.detach()
+                _last = int(_q.shape[-1])
+                # 8 heads * 256 = 2048 on a TP2 shard (16 heads * 256 / 2).
+                if _last % 256 == 0:
+                    _n = _last // 256
+                    _qnope = _q.view(*_q.shape[:-1], _n, 256)[..., :192].contiguous()
+                    _qnope.float().cpu().numpy().tofile(
+                        os.path.join(
+                            _live_col, f"torch_qnope_l{_lay}_mtp{_mtp}_r{_rank}.f32.bin"
+                        )
+                    )
+
+            def _dump_col_dy(g, tag=_tag, r=_rank, d=_live_col):
+                if g is None:
+                    return g
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_coldy_{tag}_r{r}.f32.bin")
+                )
+                return g
+
+            output.register_hook(_dump_col_dy)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -1271,7 +1396,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
 
         if bias:
             if config.use_cpu_initialization:
@@ -1289,7 +1418,11 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -320,6 +321,14 @@ class MLP(MegatronModule):
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
                         x_linear = x_linear.clamp(min=-val, max=val)
+                    if os.environ.get("MODEL_REPRO_MOE_GLU_EXPLICIT", "0") == "1":
+                        # E-183: fp32 explicit sigmoid to share libdevice expf
+                        g32 = x_glu.float()
+                        l32 = x_linear.float()
+                        s = g32 / (1.0 + torch.exp(-g32))
+                        return ((s * (l32 + self.config.glu_linear_offset))).to(
+                            x_glu.dtype
+                        )
                     return self.config.activation_func(x_glu) * (
                         x_linear + self.config.glu_linear_offset
                     )
@@ -328,10 +337,92 @@ class MLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+            _glu_d = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+            if _glu_d and getattr(self, "_is_expert_mlp", False) and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                import torch.distributed as _glud
+                _glur = _glud.get_rank() if _glud.is_initialized() else 0
+                os.makedirs(_glu_d, exist_ok=True)
+                _glul = os.environ.get("MODEL_REPRO_CUR_LAYER", "x")
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(_glu_d, f"torch_gluout_l{_glul}_e{getattr(self, '_expert_index', 'x')}_r{_glur}.f32.bin")
+                )
+
+            _act_d = os.environ.get("MODEL_REPRO_MOE_DOWNSTREAM_DUMP_DIR")
+            if _act_d and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and per_token_scale is not None:
+                import torch.distributed as _ad
+                _ark = _ad.get_rank() if _ad.is_initialized() else 0
+                os.makedirs(_act_d, exist_ok=True)
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(_act_d, f"torch_mlp_act_r{_ark}.f32.bin")
+                )
+
+            _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+            if (
+                _live
+                and getattr(self, "_is_expert_mlp", False)
+                and per_token_scale is not None
+            ):
+                import torch.distributed as _lxy
+
+                _lr = _lxy.get_rank() if _lxy.is_initialized() else 0
+                os.makedirs(_live, exist_ok=True)
+                _lay = str(getattr(self, "layer_number", "x"))
+                _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+                _eidx = getattr(self, "_expert_index", "x")
+                intermediate_parallel.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _live, f"torch_x_l{_lay}_mtp{_mtp}_e{_eidx}_r{_lr}.f32.bin"
+                    )
+                )
+                per_token_scale.detach().float().cpu().numpy().tofile(
+                    os.path.join(
+                        _live, f"torch_p_l{_lay}_mtp{_mtp}_e{_eidx}_r{_lr}.f32.bin"
+                    )
+                )
+
             if per_token_scale is not None:
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+                if _live and getattr(self, "_is_expert_mlp", False):
+                    import torch.distributed as _ldy
+
+                    _lr = _ldy.get_rank() if _ldy.is_initialized() else 0
+                    _lay = str(getattr(self, "layer_number", "x"))
+                    _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+                    _eidx = getattr(self, "_expert_index", "x")
+                    _dump = _live
+
+                    def _dump_dy(
+                        g,
+                        lay=_lay,
+                        mtp=_mtp,
+                        eidx=_eidx,
+                        r=_lr,
+                        d=_dump,
+                    ):
+                        if g is None:
+                            return
+                        g.detach().float().cpu().numpy().tofile(
+                            os.path.join(
+                                d, f"torch_dy_l{lay}_mtp{mtp}_e{eidx}_r{r}.f32.bin"
+                            )
+                        )
+
+                    intermediate_parallel.retain_grad()
+                    intermediate_parallel.register_hook(_dump_dy)
+                _act2 = os.environ.get("MODEL_REPRO_MOE_ROUTER_DUMP_DIR")
+                if os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1" and not getattr(MLP, "_dbg_act", False):
+                    MLP._dbg_act = True
+                    print(f"[ACTDBG] is_expert={getattr(self, '_is_expert_mlp', None)} idx={getattr(self, '_expert_index', None)} act2={bool(_act2)}", flush=True)
+                if _act2 and getattr(self, "_is_expert_mlp", False) and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+                    import torch.distributed as _actd2
+                    _actr2 = _actd2.get_rank() if _actd2.is_initialized() else 0
+                    os.makedirs(_act2, exist_ok=True)
+                    _lay = os.environ.get("MODEL_REPRO_CUR_LAYER", "x")
+                    intermediate_parallel.detach().float().cpu().numpy().tofile(
+                        os.path.join(_act2, f"torch_act_l{_lay}_e{getattr(self, '_expert_index', 'x')}_r{_actr2}.f32.bin")
+                    )
 
         nvtx_range_pop(suffix="activation")
 

@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -67,6 +68,52 @@ else:
 from megatron.core.transformer.pipeline_parallel_layer_layout import (
     PipelineParallelLayerLayout,
 )
+
+
+def _mtp_trace(name: str, tensor) -> None:
+    """Cross-framework audit anchor for the MTP branch forward.
+
+    E-216 pinned the divergence to this branch: the MAIN per-token cross-entropy is
+    bit-exact at every supervised position while the MTP one differs at all of them,
+    and both traverse the same output layer and the same CE kernel, so the difference
+    is already in the hidden state this branch produces. The branch is short, so every
+    intermediate is recorded here and in the PaddleFleet counterpart under the same NAME.
+
+    Anchors are keyed by name rather than by emission order on purpose: E-216 was nearly
+    misread because torch computes the MTP loss BEFORE the main logits while PaddleFleet
+    emits the main loss first, so pairing prints by order compares the main path against
+    the MTP path.
+
+    Records go to one JSONL file per rank rather than to stdout: four ranks interleave
+    on a shared stdout and long runs get truncated, so stdout cannot be trusted to carry
+    a complete record.
+    """
+    out_dir = os.environ.get('MODEL_REPRO_MTP_TRACE_DIR')
+    if not out_dir:
+        return
+    import hashlib as _hashlib
+    import json as _json
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if tensor is None:
+        record = {'rank': rank, 'name': name, 'value': None}
+    else:
+        _b = tensor.detach().float().contiguous().cpu().numpy()
+        _d = _b.astype('float64')
+        record = {
+            'rank': rank,
+            'name': name,
+            'shape': list(tensor.shape),
+            'dtype': str(tensor.dtype),
+            'md5': _hashlib.md5(_b.tobytes()).hexdigest(),
+            'sum': float(_d.sum()),
+            'abssum': float(abs(_d).sum()),
+            'absmax': float(abs(_d).max()) if _d.size else 0.0,
+            'numel': int(_d.size),
+        }
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, f'rank{rank}.jsonl'), 'a', encoding='utf-8') as stream:
+        stream.write(_json.dumps(record, sort_keys=True) + '\n')
 
 
 def tie_word_embeddings_state_dict(
@@ -817,6 +864,21 @@ class MTPLossAutoScaler(torch.autograd.Function):
         """
         (mtp_loss,) = ctx.saved_tensors
         mtp_loss_backward_scale = MTPLossAutoScaler.main_loss_backward_scale
+        if os.environ.get('MODEL_REPRO_MTP_SCALE_RECEIPT'):
+            # The scale is a class attribute set per microbatch from the schedule
+            # (pipeline_parallel/schedules.py), so reading it in the forward pass would
+            # report the PREVIOUS microbatch's value. This is the only place where the
+            # value that actually multiplies the MTP gradient is observable.
+            print(
+                f'mtp_backward_scale_receipt: rank={torch.distributed.get_rank()} '
+                f'main_loss_backward_scale={mtp_loss_backward_scale.item()!r} '
+                f'mtp_loss_shape={list(mtp_loss.shape)} '
+                f'mtp_loss_numel={mtp_loss.numel()} '
+                f'mtp_loss_sum={mtp_loss.double().sum().item()!r} '
+                f'mtp_loss_nonzero={int(mtp_loss.count_nonzero())} '
+                f'grad_output_abssum={grad_output.abs().sum().item()!r}',
+                flush=True,
+            )
         scaled_mtp_loss_grad = torch.ones_like(mtp_loss) * mtp_loss_backward_scale
         return grad_output, scaled_mtp_loss_grad
 
@@ -970,6 +1032,25 @@ def process_mtp_loss(
                 ),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        if os.environ.get('MODEL_REPRO_MTP_SCALE_RECEIPT'):
+            # Cross-framework audit anchor. The MTP loss reaches the shared trunk through
+            # eh_proj, so its effective per-token weight has to be compared against the
+            # other framework's. Printing the operands rather than the product keeps the
+            # comparison decomposable: an algebraic weighting difference shows up in the
+            # token counts, a numerical one does not.
+            print(
+                f'mtp_scale_receipt: rank={torch.distributed.get_rank()} '
+                f'layer={mtp_layer_number} '
+                f'mtp_loss_scaling_factor={config.mtp_loss_scaling_factor!r} '
+                f'mtp_num_layers={config.mtp_num_layers} '
+                f'mtp_loss_scale={mtp_loss_scale!r} '
+                f'calculate_per_token_loss={config.calculate_per_token_loss} '
+                f'original_num_tokens={original_num_tokens.item()} '
+                f'num_tokens={num_tokens.item()} '
+                f'main_loss_backward_scale='
+                f'{MTPLossAutoScaler.main_loss_backward_scale.item()}',
+                flush=True,
+            )
         if config.calculate_per_token_loss:
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).
@@ -1211,6 +1292,30 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        _mtp_trace('mtp_decoder_input', decoder_input)
+        _dump = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _dump and decoder_input is not None:
+            try:
+                import torch.distributed as _td
+
+                r = _td.get_rank() if _td.is_initialized() else 0
+            except Exception:
+                r = 0
+            if input_ids is not None:
+                input_ids.detach().reshape(-1).to(torch.int64).cpu().numpy().tofile(
+                    os.path.join(_dump, f"torch_mtpids_r{r}.i64.bin")
+                )
+            if decoder_input.requires_grad:
+
+                def _dump_mtp_dy(g, d=_dump, rr=r):
+                    if g is None:
+                        return g
+                    g.detach().float().cpu().numpy().tofile(
+                        os.path.join(d, f"torch_mtpdecin_r{rr}.f32.bin")
+                    )
+                    return g
+
+                decoder_input.register_hook(_dump_mtp_dy)
 
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
@@ -1225,6 +1330,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # here to maintain gradient flow to MTP layer parameters.
         if not hidden_states.requires_grad:
             hidden_states.requires_grad_(True)
+        _mtp_trace('mtp_trunk_hidden_in', hidden_states)
 
         return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
@@ -1238,14 +1344,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         decoder_input = make_viewless_tensor(
             inp=decoder_input, requires_grad=True, keep_graph=True
         )
+        _mtp_trace('enorm_out', decoder_input)
         hidden_states = apply_module(self.hnorm)(hidden_states)
         hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=True, keep_graph=True
         )
+        _mtp_trace('hnorm_out', hidden_states)
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
+        _mtp_trace('concat_out', hidden_states)
         hidden_states, _ = self.eh_proj(hidden_states)
+        _mtp_trace('eh_proj_out', hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
         # ranks after the linear projection.
         if InferenceMode.is_active():
@@ -1256,11 +1366,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group
             )
+        _mtp_trace('after_tp_gather', hidden_states)
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(
                 hidden_states, group=self.tp_group
             )
+        _mtp_trace('concat_embeddings_out', hidden_states)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -1330,8 +1442,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
                     )
+                    _mtp_trace('transformer_layer_out', hidden_states)
 
         hidden_states = self._postprocess(hidden_states)
+        _mtp_trace('final_layernorm_out', hidden_states)
 
         return hidden_states
 

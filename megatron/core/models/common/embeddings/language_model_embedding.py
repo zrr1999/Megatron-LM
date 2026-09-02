@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Literal, Optional
 
 import torch
@@ -109,6 +110,28 @@ class LanguageModelEmbedding(MegatronModule):
             Tensor: The output embeddings
         """
         word_embeddings = self.word_embeddings(input_ids)
+        _dump = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _dump and word_embeddings is not None and word_embeddings.requires_grad:
+            try:
+                import torch.distributed as _td
+
+                r = _td.get_rank() if _td.is_initialized() else 0
+            except Exception:
+                r = 0
+            if input_ids is not None:
+                input_ids.detach().reshape(-1).to(torch.int64).cpu().numpy().tofile(
+                    os.path.join(_dump, f"torch_embids_r{r}.i64.bin")
+                )
+
+            def _dump_word_dy(g, d=_dump, rr=r):
+                if g is None:
+                    return g
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_worddy_r{rr}.f32.bin")
+                )
+                return g
+
+            word_embeddings.register_hook(_dump_word_dy)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings

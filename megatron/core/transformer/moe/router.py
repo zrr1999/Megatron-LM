@@ -1,5 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
+
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -111,6 +113,30 @@ class Router(ABC, MegatronModule):
             )
             if self.bias is not None:
                 logits = logits + self.bias.float()
+            _dump_dir = os.environ.get("MODEL_REPRO_ROUTER_LOGITS_DUMP_DIR")
+            if _dump_dir:
+                import torch.distributed as _dist
+                _rank = _dist.get_rank() if _dist.is_initialized() else 0
+                _lay = getattr(self, "layer_number", "?")
+                os.makedirs(_dump_dir, exist_ok=True)
+                logits.detach().float().cpu().numpy().tofile(
+                    os.path.join(_dump_dir,
+                                 f"torch_gate_logits_l{_lay}_r{_rank}.f32.bin")
+                )
+                sig = torch.sigmoid(logits.detach().float())
+                sig.cpu().numpy().tofile(
+                    os.path.join(_dump_dir,
+                                 f"torch_gate_scores_l{_lay}_r{_rank}.f32.bin")
+                )
+                if logits.requires_grad:
+                    def _save_logits_grad(g, lay=_lay, rank=_rank, dump=_dump_dir):
+                        g.detach().float().cpu().numpy().tofile(
+                            os.path.join(
+                                dump, f"torch_gate_logits_grad_l{lay}_r{rank}.f32.bin"
+                            )
+                        )
+                        return g
+                    logits.register_hook(_save_logits_grad)
             return logits.view(*inp_shape[:-1], -1)
         logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
         return logits
@@ -729,6 +755,37 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+        _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _live and input is not None:
+            import torch.distributed as _lin
+
+            _lr = _lin.get_rank() if _lin.is_initialized() else 0
+            os.makedirs(_live, exist_ok=True)
+            _lay = getattr(self, "layer_number", "x")
+            _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+            input.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_routinx_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+        if _live and logits is not None:
+            import torch.distributed as _llx
+
+            _lr = _llx.get_rank() if _llx.is_initialized() else 0
+            os.makedirs(_live, exist_ok=True)
+            _lay = getattr(self, "layer_number", "x")
+            _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+            logits.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_logits_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+
+            def _dump_dlogits(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                if g is None:
+                    return
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_dlogits_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                )
+
+            logits.retain_grad()
+            logits.register_hook(_dump_dlogits)
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
@@ -741,6 +798,27 @@ class TopKRouter(Router):
             )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        _live = os.environ.get("MODEL_REPRO_LIVE_XY_DUMP_DIR")
+        if _live and probs is not None:
+            import torch.distributed as _lxy
+
+            _lr = _lxy.get_rank() if _lxy.is_initialized() else 0
+            os.makedirs(_live, exist_ok=True)
+            _lay = getattr(self, "layer_number", "x")
+            _mtp = int(bool(getattr(self, "is_mtp_layer", False)))
+            probs.detach().float().cpu().numpy().tofile(
+                os.path.join(_live, f"torch_densep_l{_lay}_mtp{_mtp}_r{_lr}.f32.bin")
+            )
+
+            def _dump_ddense(g, lay=_lay, mtp=_mtp, r=_lr, d=_live):
+                if g is None:
+                    return
+                g.detach().float().cpu().numpy().tofile(
+                    os.path.join(d, f"torch_ddensep_l{lay}_mtp{mtp}_r{r}.f32.bin")
+                )
+
+            probs.retain_grad()
+            probs.register_hook(_dump_ddense)
 
         return probs, routing_map
 

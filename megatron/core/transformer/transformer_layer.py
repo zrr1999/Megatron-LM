@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
+import os
 
 import functools
 import logging
@@ -354,6 +355,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        # DIAGNOSTIC env-gated capture hook (E-051R input/weight archival).
+        # Default off; no-op unless MODEL_REPRO_RMSNORM_ARCHIVE_DIR is set.
+        if os.environ.get("MODEL_REPRO_RMSNORM_ARCHIVE_DIR"):
+            try:
+                from model_repro_rmsnorm_capture import install as _repro_rmsnorm_install
+                _repro_rmsnorm_install(self)
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                import traceback as _tb
+                _tb.print_exc()
+                print(f"[rmsnorm-capture] install failed: {exc}")
 
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -747,6 +758,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+        _nm_dump = os.environ.get("MODEL_REPRO_FORWARD_RECEIPT_DIR")
+        _nm_lay = getattr(self, "layer_number", None)
+        if _nm_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+            import torch.distributed as _nmd
+            _nmr = _nmd.get_rank() if _nmd.is_initialized() else 0
+            os.makedirs(_nm_dump, exist_ok=True)
+            hidden_states.detach().float().cpu().numpy().tofile(
+                os.path.join(_nm_dump, f"torch_premlp_norm_in_l{_nm_lay}_r{_nmr}.f32.bin")
+            )
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
@@ -756,7 +776,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
-
+        if _nm_dump and os.environ.get("MODEL_REPRO_MOE_PER_EXPERT_DUMP", "0") == "1":
+            pre_mlp_layernorm_output.detach().float().cpu().numpy().tofile(
+                os.path.join(_nm_dump, f"torch_premlp_norm_out_l{_nm_lay}_r{_nmr}.f32.bin")
+            )
         return pre_mlp_layernorm_output
 
     def _forward_mlp(
