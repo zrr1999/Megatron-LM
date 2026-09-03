@@ -1,0 +1,144 @@
+name: Build Whl
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit to build (empty = HEAD of the selected ref)'
+        required: false
+        type: string
+        default: ''
+      update_latest:
+        description: 'Also publish the latest (0.0.0) whl'
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 16 * * *'
+
+env:
+  BRANCH: ${{ github.ref_name }}
+  COMMIT_ID: ${{ inputs.commit || github.sha }}
+  TARGET_COMMIT: ${{ inputs.commit }}
+  UPDATE_LATEST: ${{ github.event.inputs.update_latest || 'true' }}
+  work_dir: ${{ github.workspace }}
+  python_version: 3.12
+  TASK: Megatron-LM-${{ github.sha }}-build
+  CE_name: build-megatron-lm
+  no_proxy: "localhost,bj.bcebos.com,su.bcebos.com,bcebos.com,apiin.im.baidu.com,gitee.com,aliyun.com,.baidu.com,.tuna.tsinghua.edu.cn"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build
+    runs-on:
+      group: h20-2c
+    steps:
+      - name: Determine the runner
+        run: |
+          runner_name=`(echo $PWD|awk -F '/' '{print $3}')`
+          echo $runner_name
+          wget -q https://xly-devops.bj.bcebos.com/utils.sh
+          source utils.sh
+          determine_gpu_runner ${runner_name}
+      - name: Determine Image Name
+        run: |
+          echo "IMAGE_NAME=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:cuda130-dev" >> "$GITHUB_ENV"
+      - name: Run Container
+        run: |
+          container_name=${TASK}-$(date +%Y%m%d-%H%M%S)
+          echo "container_name=${container_name}" >> "$GITHUB_ENV"
+          docker run -d -t --name ${container_name} --net=host -v /dev/shm:/dev/shm --shm-size=32G \
+            -v $work_dir/../../..:$work_dir/../../.. \
+            -v $work_dir:/workspace \
+            -v /home/.cache/pip:/home/.cache/pip \
+            -e "BRANCH=$BRANCH" \
+            -e "COMMIT_ID=$COMMIT_ID" \
+            -e "TARGET_COMMIT=$TARGET_COMMIT" \
+            -e "UPDATE_LATEST=$UPDATE_LATEST" \
+            -e work_dir \
+            -e no_proxy \
+            -e CE_name \
+            -e FLAGS_dynamic_static_unified_comm \
+            -e python_version \
+            -w /workspace $IMAGE_NAME
+      - name: Checkout Code
+        run: |
+          docker exec -t $container_name /bin/bash -c '
+            rm -rf * .[^.]*
+            echo "Download Megatron-LM form https://paddle-github-action.bj.bcebos.com/whl/Megatron-LM.tar.gz"
+            wget -q --no-proxy https://paddle-github-action.bj.bcebos.com/whl/Megatron-LM.tar.gz --no-check-certificate
+            rm -rf Megatron-LM && tar --warning=no-unknown-keyword -zxf Megatron-LM.tar.gz && rm -rf Megatron-LM.tar.gz
+            source $work_dir/../../../proxy
+            cd Megatron-LM
+            git pull
+            if [ -n "$TARGET_COMMIT" ]; then
+              echo "Checkout requested commit: $TARGET_COMMIT"
+              git checkout "$TARGET_COMMIT"
+            fi
+            git log --pretty=oneline -10
+          '
+      - name: Change python version
+        run: |
+          docker exec -i -e "work_dir=$work_dir" -e "python_version=$python_version" $container_name /bin/bash <<-DOCKER_EOF
+          echo "Change python version to $python_version"
+          set -e
+          cp ${work_dir}/../../../Miniforge3-Linux-x86_64.sh /tmp/miniforge.sh
+          bash /tmp/miniforge.sh -b -p /opt/conda
+          /opt/conda/bin/conda create -n py_\$python_version python=\$python_version -y \
+            --override-channels \
+            -c conda-forge
+          . /opt/conda/etc/profile.d/conda.sh
+          conda activate py_\$python_version
+          python --version
+          DOCKER_EOF
+      - name: Build Whl
+        run: |
+          docker exec -t $container_name /bin/bash -c '
+          . /opt/conda/etc/profile.d/conda.sh
+          conda activate py_$python_version
+          python --version
+          ldconfig
+          pip config set global.cache-dir "/home/.cache/pip"
+          set -e
+          cd /workspace/Megatron-LM && git config --global --add safe.directory $PWD
+          bash scripts/dependence/build.sh
+          '
+      - name: Upload Products
+        env:
+          bos_file: ${{ github.workspace }}/bos_retry/BosClient.py
+        if: always()
+        run: |
+          docker exec -t $container_name /bin/bash -c '
+          echo "::group::Install bce-python-sdk"
+          python -m pip install bce-python-sdk==0.8.74
+          echo "::endgroup::"
+          export AK=paddle
+          export SK=paddle
+          if [ ! -f "${{ env.bos_file }}" ]; then
+            wget -q --no-proxy -O /workspace/bos_retry.tar.gz https://xly-devops.bj.bcebos.com/home/bos_retry.tar.gz --no-check-certificate
+            mkdir /workspace/bos_retry
+            tar xf /workspace/bos_retry.tar.gz -C /workspace/bos_retry
+          fi
+          cd /workspace/upload
+          for FILE in /workspace/upload/*.whl; do
+            file=$(basename "$FILE")
+            python ${{ env.bos_file }} $file paddle-github-action/whl
+            echo "$file: https://paddle-github-action.bj.bcebos.com/whl/$file"
+          done
+          TAR_FILE=/workspace/upload/Megatron-LM.tar.gz
+          if [ -e "$TAR_FILE" ]; then
+            file=$(basename "$TAR_FILE")
+            python ${{ env.bos_file }} $file paddle-github-action/whl
+            echo "$file: https://paddle-github-action.bj.bcebos.com/whl/$file"
+          else
+            echo "Megatron-LM.tar.gz not found, skip upload"
+          fi
+          '
+      - name: Terminate And Delete the Container
+        if: always()
+        run: |
+          docker rm -f $container_name 2>/dev/null || true
