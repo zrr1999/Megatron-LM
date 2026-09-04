@@ -21,6 +21,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+def test_uac_keeps_mcore_num_tokens_scaling():
+    """Shipped finalize_model_grads must not skip 1/num_tokens under UAC (E-172)."""
+    src = inspect.getsource(finalize_model_grads)
+    assert "loss_normalized_in_graph = False" in src
+    assert "num_tokens = None" not in src.split("loss_normalized_in_graph = False", 1)[1][
+        :800
+    ]
+    assert "scale_gradients(1.0 / dp_size)" not in src
+
+
 class _RouterExpertBiasModel(torch.nn.Module):
     def __init__(self, config, local_tokens_per_expert):
         super().__init__()
