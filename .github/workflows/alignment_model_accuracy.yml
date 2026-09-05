@@ -161,6 +161,7 @@ jobs:
       - name: Get Whl
         run: |
           docker exec -t $container_name /bin/bash -c '
+          set -eo pipefail
           . /opt/conda/etc/profile.d/conda.sh
           conda activate py_$python_version
           python --version
@@ -173,9 +174,10 @@ jobs:
             python -m pip install uv
             test -x /workspace/Megatron-LM/scripts/select_paddlefleet_alignment_pin.sh \
               || { echo "::error:: selector missing; checkout did not land COMMIT_ID"; exit 1; }
-            bash /workspace/Megatron-LM/scripts/select_paddlefleet_alignment_pin.sh --dest /workspace
-            cat /workspace/paddlefleet_alignment_pin_receipt.json
-            test -f /workspace/paddlefleet_alignment_pin.env
+            bash /workspace/Megatron-LM/scripts/select_paddlefleet_alignment_pin.sh --dest /workspace \
+              || { echo "::error:: selector failed; stop Get Whl (do not download remaining wheels or build megatron-core)"; exit 1; }
+            bash /workspace/Megatron-LM/scripts/require_paddlefleet_selector_ok.sh /workspace \
+              || { echo "::error:: selector receipt status is not ok; stop Get Whl"; exit 1; }
             echo "::endgroup::"
             echo "::group::Download remaining wheels from BOS"
             for url in \
@@ -209,6 +211,7 @@ jobs:
       - name: alignment_model_accuracy
         run: |
           docker exec -t $container_name /bin/bash -c '
+          set -eo pipefail
           . /opt/conda/etc/profile.d/conda.sh
           conda activate py_$python_version
           python --version

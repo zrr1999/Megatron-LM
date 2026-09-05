@@ -58,6 +58,31 @@ if ALIGNMENT_PADDLEFLEET_MODE=stack-paired PADDLEFLEET_PIN_SHA="${PIN}" \
   exit 1
 fi
 
+# Negative: selector clone/fail writes error receipt and no env. Consume
+# must name selector failure. Missing env here is the consequence, not
+# proof that a generated env failed to cross docker exec.
+REQUIRE="${ROOT}/require_paddlefleet_selector_ok.sh"
+mkdir -p "${tmp}/sel-fail"
+cat >"${tmp}/sel-fail/paddlefleet_alignment_pin_receipt.json" <<'EOF'
+{"schema":"paddlefleet-alignment-pin/v1","status":"error","detail":"git clone failed: github.com:443","mode":"stack-paired"}
+EOF
+if bash "${REQUIRE}" "${tmp}/sel-fail" >"${tmp}/sel-fail.require.out" 2>"${tmp}/sel-fail.require.err"; then
+  echo "handoff FAIL: require_ok accepted error receipt" >&2
+  exit 1
+fi
+grep -q "selector receipt status=" "${tmp}/sel-fail.require.err"
+if ALIGNMENT_PADDLEFLEET_MODE=stack-paired PADDLEFLEET_PIN_SHA="${PIN}" \
+    bash "${CONSUME}" --env "${tmp}/sel-fail/paddlefleet_alignment_pin.env" \
+    --out "${tmp}/sel-fail.consumed.env" 2>"${tmp}/sel-fail.err"; then
+  echo "handoff FAIL: selector error receipt was consumed" >&2
+  exit 1
+fi
+grep -q "because selector failed" "${tmp}/sel-fail.err"
+if grep -q "selector wrote ok receipt but env did not cross docker exec" "${tmp}/sel-fail.err"; then
+  echo "handoff FAIL: selector error misclassified as env-handoff" >&2
+  exit 1
+fi
+
 # Step C: path consumer only. Does not run uv or setup_venvs.sh.
 stub_setup="${tmp}/setup_path_consumer.sh"
 cat >"${stub_setup}" <<'STUB'

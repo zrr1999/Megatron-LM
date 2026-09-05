@@ -154,7 +154,24 @@ consume() {
   parse_envfile
 
   if [[ "${requested_mode}" == "stack-paired" ]]; then
-    [[ -f "${ENVFILE}" ]] || fail "stack-paired missing ${ENVFILE}; selector export did not cross docker exec"
+    if [[ ! -f "${ENVFILE}" ]]; then
+      local rec="${ENVFILE%/*}/paddlefleet_alignment_pin_receipt.json"
+      local rec_status=""
+      if [[ -f "${rec}" ]]; then
+        rec_status="$(python3 - "${rec}" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1])).get("status") or "")
+PY
+)"
+      fi
+      if [[ "${rec_status}" == "error" ]]; then
+        fail "stack-paired missing ${ENVFILE} because selector failed (error receipt ${rec}); Get Whl must exit on selector failure. This is not proof that a generated env failed to cross docker exec"
+      fi
+      if [[ "${rec_status}" == "ok" ]]; then
+        fail "stack-paired missing ${ENVFILE}; selector wrote ok receipt but env did not cross docker exec"
+      fi
+      fail "stack-paired missing ${ENVFILE} and no selector receipt"
+    fi
     [[ "${FILE_MODE}" == "stack-paired" ]] || fail "requested stack-paired but env mode=${FILE_MODE:-empty} (will not consume a develop leftover)"
     if [[ -n "${requested_pin}" ]]; then
       local file_id="${FILE_PIN:-${FILE_SOURCE}}"
@@ -322,6 +339,24 @@ EOF
   if ALIGNMENT_PADDLEFLEET_MODE=stack-paired PADDLEFLEET_PIN_SHA="${pin}" \
       bash "${self}" --env "${root}/bare.env" --out "${root}/bare.consumed.env"; then
     echo "self-test FAIL: unproven 0.0.0 fallback should be rejected" >&2
+    exit 1
+  fi
+
+  # Selector clone/fail: error receipt, no env. Missing env is the
+  # consequence, not proof a generated env failed to cross docker exec.
+  mkdir -p "${root}/sel-fail"
+  cat >"${root}/sel-fail/paddlefleet_alignment_pin_receipt.json" <<'EOF'
+{"schema":"paddlefleet-alignment-pin/v1","status":"error","detail":"git clone failed: github.com:443","mode":"stack-paired"}
+EOF
+  if ALIGNMENT_PADDLEFLEET_MODE=stack-paired PADDLEFLEET_PIN_SHA="${pin}" \
+      bash "${self}" --env "${root}/sel-fail/paddlefleet_alignment_pin.env" \
+      --out "${root}/sel-fail.consumed.env" 2>"${root}/sel-fail.err"; then
+    echo "self-test FAIL: selector error receipt was consumed" >&2
+    exit 1
+  fi
+  grep -q "because selector failed" "${root}/sel-fail.err"
+  if grep -q "selector wrote ok receipt but env did not cross docker exec" "${root}/sel-fail.err"; then
+    echo "self-test FAIL: selector error misclassified as env-handoff" >&2
     exit 1
   fi
 
