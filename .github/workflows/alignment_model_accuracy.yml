@@ -215,6 +215,8 @@ jobs:
           ldconfig
           source $work_dir/../../../proxy
           export PROXY_URL="${http_proxy}"
+          ALIGNMENT_PADDLEFLEET_MODE="${ALIGNMENT_PADDLEFLEET_MODE:-develop}" \
+          PADDLEFLEET_PIN_SHA="${PADDLEFLEET_PIN_SHA:-}" \
           bash /workspace/Megatron-LM/scripts/consume_paddlefleet_alignment_pin.sh \
             --env /workspace/paddlefleet_alignment_pin.env \
             --out /workspace/paddlefleet_alignment_pin.consumed.env

@@ -254,6 +254,8 @@ PADDLEFLEET_SOURCE_COMMIT=${ACTUAL_SHA}
 PADDLEFLEET_PIN_SHA=${PIN_SHA}
 PADDLEFLEET_WHEEL_ORIGIN=${WHEEL_ORIGIN}
 PADDLEFLEET_OPS_ORIGIN=${OPS_ORIGIN}
+PADDLEFLEET_WHEEL_DIGEST_VERIFIED=${WHEEL_DIGEST_VERIFIED}
+PADDLEFLEET_OPS_DIGEST_VERIFIED=${OPS_DIGEST_VERIFIED}
 EOF
 }
 
@@ -676,6 +678,7 @@ PY
   grep -q "PADDLEFLEET_WHEEL_PATH=${root}/ok-source/PaddleFleet$" "${root}/ok-source/paddlefleet_alignment_pin.env"
   grep -q "PADDLEFLEET_OPS_WHEEL_PATH=${root}/ok-source/PaddleFleet/packages/paddlefleet_ops$" "${root}/ok-source/paddlefleet_alignment_pin.env"
   grep -q "PADDLEFLEET_WHEEL_ORIGIN=source_tree" "${root}/ok-source/paddlefleet_alignment_pin.env"
+  grep -q "PADDLEFLEET_WHEEL_DIGEST_VERIFIED=false" "${root}/ok-source/paddlefleet_alignment_pin.env"
   grep -q "PADDLEFLEET_SOURCE_COMMIT=${sha_b}" "${root}/ok-source/paddlefleet_alignment_pin.env"
 
   grep -q 'CodeSync/develop/PaddleFleet.tar' "${script}"
