@@ -122,17 +122,25 @@ jobs:
             git config --global --add safe.directory /workspace/Megatron-LM
             git pull
             git submodule update --init --recursive --force
+            git remote add upstream https://github.com/PFCCLab/Megatron-LM.git || true
             if [ -n "$PR_ID" ] && [ "$PR_ID" != "0" ]; then
               git fetch origin pull/${PR_ID}/head
-              git checkout -b PR_${PR_ID} FETCH_HEAD
-              git remote add upstream https://github.com/PFCCLab/Megatron-LM.git
+              git checkout -B PR_${PR_ID} FETCH_HEAD
               echo "Checking out ${BRANCH}..."
-              git fetch upstream ${BRANCH}:${BRANCH}
-              git merge ${BRANCH} --no-edit
+              git fetch upstream ${BRANCH}:${BRANCH} || true
+              git merge ${BRANCH} --no-edit || true
               git diff --numstat ${BRANCH} -- | awk "{print \$NF}"
+            elif [ -n "$COMMIT_ID" ]; then
+              echo "workflow_dispatch: checkout COMMIT_ID=${COMMIT_ID} (not BOS main)"
+              git fetch --all --tags || true
+              git fetch origin "$COMMIT_ID" || git fetch upstream "$COMMIT_ID" || true
+              git checkout --force "$COMMIT_ID"
+              git submodule update --init --recursive --force
             else
-              echo "Not in a pull_request event. Skipping PR-specific operations."
+              echo "Not in a pull_request event and COMMIT_ID empty. Leaving tarball HEAD."
             fi
+            echo "checked_out_head=$(git rev-parse HEAD)"
+            test -z "$COMMIT_ID" || test "$(git rev-parse HEAD)" = "$COMMIT_ID"
             git log --pretty=oneline -10
           '
       - name: Change python version
@@ -163,8 +171,11 @@ jobs:
           if [ "${ALIGNMENT_PADDLEFLEET_MODE:-develop}" = "stack-paired" ]; then
             echo "::group::Select stack-paired PaddleFleet (fail-closed SHA)"
             python -m pip install uv
+            test -x /workspace/Megatron-LM/scripts/select_paddlefleet_alignment_pin.sh \
+              || { echo "::error:: selector missing; checkout did not land COMMIT_ID"; exit 1; }
             bash /workspace/Megatron-LM/scripts/select_paddlefleet_alignment_pin.sh --dest /workspace
             cat /workspace/paddlefleet_alignment_pin_receipt.json
+            test -f /workspace/paddlefleet_alignment_pin.env
             echo "::endgroup::"
             echo "::group::Download remaining wheels from BOS"
             for url in \
@@ -204,12 +215,12 @@ jobs:
           ldconfig
           source $work_dir/../../../proxy
           export PROXY_URL="${http_proxy}"
-          if [ -f /workspace/paddlefleet_alignment_pin.env ]; then
-            . /workspace/paddlefleet_alignment_pin.env
-            echo "loaded pin receipt ${PADDLEFLEET_PIN_RECEIPT:-/workspace/paddlefleet_alignment_pin_receipt.json}"
-          fi
-          export PADDLEFLEET_WHEEL_PATH="${PADDLEFLEET_WHEEL_PATH:-/workspace/paddlefleet-0.0.0-py3-none-linux_x86_64.whl}"
-          export PADDLEFLEET_OPS_WHEEL_PATH="${PADDLEFLEET_OPS_WHEEL_PATH:-/workspace/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl}"
+          bash /workspace/Megatron-LM/scripts/consume_paddlefleet_alignment_pin.sh \
+            --env /workspace/paddlefleet_alignment_pin.env \
+            --out /workspace/paddlefleet_alignment_pin.consumed.env
+          set -a
+          . /workspace/paddlefleet_alignment_pin.consumed.env
+          set +a
           export MEGATRON_CORE_WHEEL_PATH=/workspace/upload/megatron_core-0.0.0-cp312-cp312-linux_x86_64.whl
           export MS_SWIFT_WHEEL_PATH=/workspace/ms_swift-0.0.0-py3-none-any.whl
           export MCORE_BRIDGE_WHEEL_PATH=/workspace/mcore_bridge-0.0.0-py3-none-any.whl
@@ -219,7 +230,7 @@ jobs:
           for whl in "$PADDLEFLEET_WHEEL_PATH" "$PADDLEFLEET_OPS_WHEEL_PATH" \
             "$MS_SWIFT_WHEEL_PATH" "$MEGATRON_CORE_WHEEL_PATH" \
             "$MCORE_BRIDGE_WHEEL_PATH"; do
-            [ -f "$whl" ] || [ -d "$whl" ] || { echo "::error:: missing wheel: $whl"; exit 1; }
+            [ -e "$whl" ] || { echo "::error:: missing wheel: $whl"; exit 1; }
             echo "using $whl"
           done
           python -m pip install uv

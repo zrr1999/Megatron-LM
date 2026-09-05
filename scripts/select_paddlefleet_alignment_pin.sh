@@ -121,6 +121,10 @@ pairing_fields() {
   if [[ "${MODE}" == "develop" ]]; then
     status="unpaired_default"
     reason="develop tarball and develop/latest wheels; not a stack pin"
+  elif [[ "${WHEEL_ORIGIN}" == "source_tree" && "${OPS_ORIGIN}" == "source_tree" \
+      && "${SOURCE_VERIFIED}" == "true" ]]; then
+    status="source_tree_from_checked_out_pin"
+    reason="this invocation exported checked-out source trees; not a wheel digest proof"
   elif [[ "${WHEEL_ORIGIN}" == "build" && "${OPS_ORIGIN}" == "build" \
       && "${WHEEL_BUILT_FROM_COMMIT}" == "${ACTUAL_SHA}" \
       && "${OPS_BUILT_FROM_COMMIT}" == "${ACTUAL_SHA}" \
@@ -247,6 +251,9 @@ PADDLEFLEET_OPS_WHEEL_PATH=${PADDLEFLEET_OPS_WHEEL_PATH}
 ALIGNMENT_PADDLEFLEET_MODE=${MODE}
 PADDLEFLEET_PIN_RECEIPT=${DEST}/paddlefleet_alignment_pin_receipt.json
 PADDLEFLEET_SOURCE_COMMIT=${ACTUAL_SHA}
+PADDLEFLEET_PIN_SHA=${PIN_SHA}
+PADDLEFLEET_WHEEL_ORIGIN=${WHEEL_ORIGIN}
+PADDLEFLEET_OPS_ORIGIN=${OPS_ORIGIN}
 EOF
 }
 
@@ -413,11 +420,35 @@ fetch_default() {
   write_receipt "ok" "develop tarball and develop/latest wheels; unpaired with a stack pin"
 }
 
+acquire_source_tree() {
+  local src="${DEST}/PaddleFleet"
+  local ops="${src}/packages/paddlefleet_ops"
+  [[ -d "${src}" ]] || fail "stack-paired source tree missing: ${src}"
+  [[ -f "${src}/pyproject.toml" ]] || fail "stack-paired source tree missing pyproject.toml: ${src}"
+  [[ -d "${ops}" ]] || fail "stack-paired ops source tree missing: ${ops}"
+  PADDLEFLEET_WHEEL_PATH="${src}"
+  PADDLEFLEET_OPS_WHEEL_PATH="${ops}"
+  WHEEL_ORIGIN="source_tree"
+  OPS_ORIGIN="source_tree"
+  WHEEL_BUILT_FROM_COMMIT="${ACTUAL_SHA}"
+  OPS_BUILT_FROM_COMMIT="${ACTUAL_SHA}"
+  WHEEL_DIGEST_VERIFIED=false
+  OPS_DIGEST_VERIFIED=false
+  LOADED_FROM="source_tree ${src} ${ops} from ${ACTUAL_SHA}"
+  log "source-tree paths ${src} ${ops}"
+}
+
 fetch_stack_paired() {
   log "mode=stack-paired"
   checkout_pin
-  acquire_wheel
-  acquire_ops
+  if [[ -n "${WHEEL_URL}" || -n "${OPS_URL}" || -n "${BUILD_CMD}" || -n "${BUILD_OPS_CMD}" ]]; then
+    acquire_wheel
+    acquire_ops
+  else
+    # No CI wheel URL and no explicit build: export the checked-out trees.
+    # A later docker exec must source paddlefleet_alignment_pin.env.
+    acquire_source_tree
+  fi
   export_receipt_env
   write_envfile
   local pair pairing_status
@@ -473,7 +504,10 @@ run_self_test() {
   git -C "${root}/upstream" config user.email test@example.com
   git -C "${root}/upstream" config user.name test
   echo source-a >"${root}/upstream/README"
-  git -C "${root}/upstream" add README
+  mkdir -p "${root}/upstream/packages/paddlefleet_ops"
+  printf '%s\n' '[project]' 'name = "paddlefleet"' >"${root}/upstream/pyproject.toml"
+  printf '%s\n' '[project]' 'name = "paddlefleet-ops"' >"${root}/upstream/packages/paddlefleet_ops/pyproject.toml"
+  git -C "${root}/upstream" add README pyproject.toml packages
   git -C "${root}/upstream" commit -q -m a
   local sha_a sha_b
   sha_a="$(git -C "${root}/upstream" rev-parse HEAD)"
@@ -618,6 +652,31 @@ assert doc["pairing"]["status"] == "built_from_checked_out_pin"
 print("ok-build receipt fields checked")
 PY
   grep -q "PADDLEFLEET_SOURCE_COMMIT=${sha_b}" "${root}/ok-build/paddlefleet_alignment_pin.env"
+
+  run ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
+      PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
+      bash "${script}" --dest "${root}/ok-source"
+  python3 - "${root}/ok-source/paddlefleet_alignment_pin_receipt.json" "${sha_b}" "${root}/ok-source" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+sha_b, dest = sys.argv[2], sys.argv[3]
+assert doc["status"] == "ok"
+assert doc["source"]["actual_commit"] == sha_b
+assert doc["source"]["commit_verified"] is True
+wheel = next(a for a in doc["artifacts"] if a["name"] == "paddlefleet")
+ops = next(a for a in doc["artifacts"] if a["name"] == "paddlefleet_ops")
+assert wheel["path"] == f"{dest}/PaddleFleet"
+assert ops["path"] == f"{dest}/PaddleFleet/packages/paddlefleet_ops"
+assert wheel["origin"] == "source_tree"
+assert ops["origin"] == "source_tree"
+assert doc["pairing"]["status"] == "source_tree_from_checked_out_pin"
+assert doc["pairing"]["stack_paired_proven"] is False
+print("ok-source receipt fields checked")
+PY
+  grep -q "PADDLEFLEET_WHEEL_PATH=${root}/ok-source/PaddleFleet$" "${root}/ok-source/paddlefleet_alignment_pin.env"
+  grep -q "PADDLEFLEET_OPS_WHEEL_PATH=${root}/ok-source/PaddleFleet/packages/paddlefleet_ops$" "${root}/ok-source/paddlefleet_alignment_pin.env"
+  grep -q "PADDLEFLEET_WHEEL_ORIGIN=source_tree" "${root}/ok-source/paddlefleet_alignment_pin.env"
+  grep -q "PADDLEFLEET_SOURCE_COMMIT=${sha_b}" "${root}/ok-source/paddlefleet_alignment_pin.env"
 
   grep -q 'CodeSync/develop/PaddleFleet.tar' "${script}"
   grep -q 'PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl' "${script}"
