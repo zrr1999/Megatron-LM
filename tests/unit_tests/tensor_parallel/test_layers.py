@@ -1,10 +1,56 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.layers import linear_with_frozen_weight
+from megatron.core.tensor_parallel.layers import (
+    _expert_grads_need_own_dp_domain,
+    linear_with_frozen_weight,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_expert_grads_need_own_dp_domain_etp_lt_tp():
+    """EP=1 / ETP=1 / TP=2 expert wgrad must leave the dense dp_cp bucket."""
+    frozen = SimpleNamespace(
+        expert_model_parallel_size=1,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+    )
+    assert _expert_grads_need_own_dp_domain(frozen) is True
+    eq = SimpleNamespace(
+        expert_model_parallel_size=1,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+    )
+    assert _expert_grads_need_own_dp_domain(eq) is False
+    ep2 = SimpleNamespace(
+        expert_model_parallel_size=2,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+    )
+    assert _expert_grads_need_own_dp_domain(ep2) is True
+    missing = SimpleNamespace(
+        expert_model_parallel_size=1,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=None,
+    )
+    assert _expert_grads_need_own_dp_domain(missing) is False
+
+
+def test_expert_dp_domain_is_wired_into_linear_allreduce():
+    """Column/Row/TE expert allreduce must use the ETP<TP helper, not EP-only."""
+    root = Path(__file__).resolve().parents[3]
+    layers = (root / "megatron/core/tensor_parallel/layers.py").read_text()
+    te = (root / "megatron/core/extensions/transformer_engine.py").read_text()
+    assert "def _expert_grads_need_own_dp_domain" in layers
+    assert layers.count("not (self.is_expert and _expert_grads_need_own_dp_domain(config))") == 4
+    assert "not (self.is_expert and self.expert_parallel)" not in layers
+    assert "_expert_grads_need_own_dp_domain" in te
+    assert "not (is_expert and self.expert_parallel)" not in te
 
 
 @pytest.mark.parametrize("tensor_parallel,allreduce_dgrad", [(1, False), (8, True)])

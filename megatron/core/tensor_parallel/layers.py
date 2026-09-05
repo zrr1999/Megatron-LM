@@ -777,6 +777,31 @@ def linear_with_grad_accumulation_and_async_allreduce(
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
+def _expert_grads_need_own_dp_domain(config) -> bool:
+    """Whether expert parameters must be reduced over the expert-data-parallel group.
+
+    mcore normally decides this from ``expert_model_parallel_size > 1`` alone, which
+    is correct only when the expert tensor-parallel size equals the dense one: the
+    expert parameter is then sharded exactly like a dense parameter and its
+    data-parallel domain coincides with ``dp_cp``.
+
+    With ``expert_tensor_parallel_size < tensor_model_parallel_size`` (the accuracy
+    -compatible topology uses ETP=1 with TP=2) every rank in the tensor-parallel
+    group holds a FULL copy of the expert weight while consuming only its own
+    sequence-parallel shard of the tokens. Those partial weight gradients live in a
+    larger data-parallel domain (``expt_dp`` = TP/ETP times ``dp_cp``) and must be
+    summed. Leaving ``allreduce=True`` puts them in the dense bucket, which is
+    reduced over ``dp_cp`` — size 1 in this topology — so the reduction silently
+    never happens and every expert gradient stays a per-rank partial sum.
+    """
+    if config.expert_model_parallel_size > 1:
+        return True
+    etp = getattr(config, 'expert_tensor_parallel_size', None)
+    if etp is None:
+        return False
+    return etp != config.tensor_model_parallel_size
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -921,7 +946,11 @@ class ColumnParallelLinear(torch.nn.Module):
                         tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
-            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.weight,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.weight = None
 
@@ -943,7 +972,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -1271,7 +1304,11 @@ class RowParallelLinear(torch.nn.Module):
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
-        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
+        setattr(
+            self.weight,
+            "allreduce",
+            not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+        )
 
         if bias:
             if config.use_cpu_initialization:
@@ -1289,7 +1326,11 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(
+                self.bias,
+                "allreduce",
+                not (self.is_expert and _expert_grads_need_own_dp_domain(config)),
+            )
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
