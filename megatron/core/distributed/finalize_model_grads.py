@@ -463,7 +463,8 @@ def finalize_model_grads(
     # E-172: keep mcore 1/num_tokens scaling under use_accuracy_compatible.
     # calculate_per_token_loss=true backprops raw sum(loss*mask); skipping this
     # left every gradient num_tokens times too large (44.0x at step 1). Formal
-    # N=5 with the skip matched step-1 IEEE but drifted at steps 2-5.
+    # N=5 with the skip matched step-1 IEEE but drifted at steps 2-5. Do not
+    # take main's GLM-4.5 skip (loss_normalized_in_graph=True / num_tokens=None).
     from ..transformer.module import _use_accuracy_compatible
 
     loss_normalized_in_graph = False
