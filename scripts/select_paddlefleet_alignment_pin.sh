@@ -20,7 +20,9 @@
 #   Cases are not filtered.
 #
 # Explicit (ALIGNMENT_PADDLEFLEET_MODE=stack-paired): fail-closed.
-#   Checkout PADDLEFLEET_PIN_SHA; git rev-parse HEAD must equal the pin.
+#   Fetch PADDLEFLEET_PIN_SHA at depth 1 (not a full default-branch clone).
+#   Transient git RPC/curl failures retry up to 3 clean dests; other
+#   fetch errors fail closed. git rev-parse HEAD must equal the pin.
 #   Artifacts: caller URL+sha256 (from Build Fleet whl / Actions metadata)
 #   or build from the checked-out tree. Independent digest matches do not
 #   prove the wheels were produced from that commit — receipt records
@@ -292,26 +294,65 @@ require_digest() {
   fi
 }
 
+# Auth / missing-object / missing-repo are permanent. Do not treat a
+# generic "RPC failed" as transient: HTTP 401/403 also say RPC failed.
+_is_permanent_git_err() {
+  case "$1" in
+    *"HTTP 401"*|*"HTTP 403"*|*"Authentication failed"*|*"access denied"*|*"Access denied"*|*"Permission denied"*|*"not our ref"*|*"does not appear to be a git repository"*|*"Could not read from remote repository"*|*"remote: Write access"*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+_is_transient_git_err() {
+  _is_permanent_git_err "$1" && return 1
+  case "$1" in
+    *"curl 56"*|*"Connection timed out"*|*"Couldn't connect to server"*|*"Failed to connect to github.com port 443"*|*"early EOF"*|*"fetch-pack: unexpected disconnect"*|*"bytes of body are still expected"*|*"invalid index-pack output"*|*"Connection reset by peer"*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 checkout_pin() {
   [[ "${PIN_SHA}" =~ ^[0-9a-fA-F]{40}$ ]] || fail "stack-paired requires PADDLEFLEET_PIN_SHA (40 hex), got '${PIN_SHA}'"
   PIN_SHA="$(printf '%s' "${PIN_SHA}" | tr 'A-F' 'a-f')"
-  rm -rf "${DEST}/PaddleFleet"
-  log "clone ${GIT_URL}"
-  if ! git clone --quiet "${GIT_URL}" "${DEST}/PaddleFleet" >/dev/null 2>"${DEST}/.git-clone.err"; then
-    fail "git clone failed: $(tr '\n' ' ' <"${DEST}/.git-clone.err")"
-  fi
-  git -C "${DEST}/PaddleFleet" config advice.detachedHead false || true
-  log "checkout ${PIN_SHA}"
-  if ! git -C "${DEST}/PaddleFleet" checkout --quiet --force "${PIN_SHA}" >/dev/null 2>"${DEST}/.git-co.err"; then
-    fail "git checkout failed for ${PIN_SHA}: $(tr '\n' ' ' <"${DEST}/.git-co.err")"
-  fi
-  ACTUAL_SHA="$(git -C "${DEST}/PaddleFleet" rev-parse HEAD)"
-  if [[ "${ACTUAL_SHA}" != "${PIN_SHA}" ]]; then
-    SOURCE_VERIFIED=false
-    fail "stack-paired source SHA mismatch expected=${PIN_SHA} actual=${ACTUAL_SHA}"
-  fi
-  SOURCE_VERIFIED=true
-  log "source commit verified ${ACTUAL_SHA}"
+  local dest="${DEST}/PaddleFleet"
+  local attempt max_attempts=3
+  local last_err=""
+  local fetch_err="${DEST}/.git-fetch.err"
+  for attempt in $(seq 1 "${max_attempts}"); do
+    rm -rf "${dest}"
+    log "fetch ${GIT_URL} ${PIN_SHA} (attempt ${attempt}/${max_attempts})"
+    if ! git init --quiet "${dest}" >/dev/null 2>"${DEST}/.git-init.err"; then
+      fail "git init failed: $(tr '\n' ' ' <"${DEST}/.git-init.err")"
+    fi
+    if ! git -C "${dest}" remote add origin "${GIT_URL}" >/dev/null 2>"${DEST}/.git-remote.err"; then
+      fail "git remote add failed: $(tr '\n' ' ' <"${DEST}/.git-remote.err")"
+    fi
+    git -C "${dest}" config advice.detachedHead false || true
+    if GIT_TERMINAL_PROMPT=0 git -C "${dest}" fetch --depth=1 --no-tags origin "${PIN_SHA}" \
+        >/dev/null 2>"${fetch_err}"; then
+      if ! git -C "${dest}" checkout --quiet --force --detach "${PIN_SHA}" >/dev/null 2>"${DEST}/.git-co.err"; then
+        fail "git checkout failed for ${PIN_SHA}: $(tr '\n' ' ' <"${DEST}/.git-co.err")"
+      fi
+      ACTUAL_SHA="$(git -C "${dest}" rev-parse HEAD)"
+      if [[ "${ACTUAL_SHA}" != "${PIN_SHA}" ]]; then
+        SOURCE_VERIFIED=false
+        fail "stack-paired source SHA mismatch expected=${PIN_SHA} actual=${ACTUAL_SHA}"
+      fi
+      SOURCE_VERIFIED=true
+      log "source commit verified ${ACTUAL_SHA}"
+      return 0
+    fi
+    last_err="$(tr '\n' ' ' <"${fetch_err}")"
+    if ! _is_transient_git_err "${last_err}"; then
+      fail "git fetch failed: ${last_err}"
+    fi
+    log "transient fetch failure attempt ${attempt}/${max_attempts}: ${last_err}"
+  done
+  fail "git fetch failed: ${last_err}"
 }
 
 # Sets DEST_PATH and DEST_SHA in the caller. Must run in this shell so
@@ -557,7 +598,7 @@ run_self_test() {
         PADDLEFLEET_OPS_WHEEL_SHA256="${ops_sha}" \
     bash "${script}" --dest "${root}/m2"
 
-  expect_fail "${root}/m3" "git checkout failed" \
+  expect_fail "${root}/m3" "git fetch failed" \
     run ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
         PADDLEFLEET_PIN_SHA="0000000000000000000000000000000000000000" \
         PADDLEFLEET_GIT_URL="${root}/upstream" \
@@ -599,11 +640,158 @@ PY
         PADDLEFLEET_OPS_WHEEL_SHA256="${ops_sha}" \
     bash "${script}" --dest "${root}/m6"
 
-  expect_fail "${root}/m7" "git clone failed" \
+  expect_fail "${root}/m7" "git fetch failed" \
     run ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
         PADDLEFLEET_PIN_SHA="${sha_b}" \
         PADDLEFLEET_GIT_URL="${root}/no-such-remote" \
     bash "${script}" --dest "${root}/m7"
+
+  assert_error_unverified() {
+    python3 - "$1" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["status"] == "error", doc
+assert doc["source"]["commit_verified"] is False, doc["source"]
+print("error receipt commit_verified=false")
+PY
+  }
+
+  assert_pin_checkout() {
+    local repo="$1" sha="$2"
+    [[ "$(git -C "${repo}" rev-parse HEAD)" == "${sha}" ]]
+    [[ -f "${repo}/.git/shallow" ]] || { echo "self-test FAIL: missing ${repo}/.git/shallow" >&2; exit 1; }
+    [[ "$(git -C "${repo}" rev-list --count HEAD)" == 1 ]] || {
+      echo "self-test FAIL: ${repo} rev-list count != 1 (not depth=1)" >&2
+      exit 1
+    }
+    if git -C "${repo}" symbolic-ref -q HEAD >/dev/null; then
+      echo "self-test FAIL: ${repo} HEAD is a branch, not detached pin" >&2
+      git -C "${repo}" symbolic-ref HEAD >&2
+      exit 1
+    fi
+  }
+
+  write_git_wrapper() {
+    local bindir="$1" mode="$2"
+    local real_git
+    real_git="$(command -v git)"
+    mkdir -p "${bindir}"
+    cat >"${bindir}/git" <<GITWRAP
+#!/usr/bin/env bash
+set -euo pipefail
+STATE="${bindir}/count"
+STALE="${bindir}/stale"
+real="${real_git}"
+count=0
+[[ -f "\${STATE}" ]] && count="\$(cat "\${STATE}")"
+workdir=""
+is_fetch=0
+has_depth=0
+has_no_tags=0
+args=("\$@")
+i=0
+while [[ \$i -lt \${#args[@]} ]]; do
+  a="\${args[\$i]}"
+  if [[ "\$a" == "-C" ]]; then
+    workdir="\${args[\$((i+1))]}"
+    i=\$((i+2))
+    continue
+  fi
+  [[ "\$a" == fetch ]] && is_fetch=1
+  [[ "\$a" == --depth=1 ]] && has_depth=1
+  [[ "\$a" == --no-tags ]] && has_no_tags=1
+  i=\$((i+1))
+done
+if [[ "\$is_fetch" -eq 1 ]]; then
+  [[ -n "\$workdir" ]] || workdir="\$PWD"
+  if [[ -e "\$workdir/.retry-sentinel" ]]; then
+    echo "stale dest sentinel still present in \$workdir" >>"\$STALE"
+    exit 99
+  fi
+  if [[ "\$has_depth" -ne 1 || "\$has_no_tags" -ne 1 ]]; then
+    echo "fetch missing --depth=1/--no-tags: \${args[*]}" >>"\$STALE"
+    exit 99
+  fi
+  count=\$((count + 1))
+  printf '%s\n' "\$count" >"\$STATE"
+  case "${mode}" in
+    401)
+      echo "RPC failed; HTTP 401 curl 22 The requested URL returned error: 401" >&2
+      echo "fatal: Authentication failed" >&2
+      printf 'sentinel\n' >"\$workdir/.retry-sentinel"
+      exit 128
+      ;;
+    exhaust)
+      echo "error: RPC failed; curl 56 Recv failure: Connection timed out" >&2
+      echo "error: 9515 bytes of body are still expected" >&2
+      echo "fatal: early EOF" >&2
+      printf 'sentinel\n' >"\$workdir/.retry-sentinel"
+      exit 128
+      ;;
+    retry)
+      if [[ "\$count" -lt 3 ]]; then
+        echo "error: RPC failed; curl 56 Recv failure: Connection timed out" >&2
+        echo "error: 9515 bytes of body are still expected" >&2
+        echo "fetch-pack: unexpected disconnect while reading sideband packet" >&2
+        echo "fatal: early EOF" >&2
+        echo "fatal: fetch-pack: invalid index-pack output" >&2
+        printf 'sentinel\n' >"\$workdir/.retry-sentinel"
+        exit 128
+      fi
+      ;;
+  esac
+fi
+exec "\$real" "\$@"
+GITWRAP
+    chmod +x "${bindir}/git"
+  }
+
+  assert_error_unverified "${root}/m3/paddlefleet_alignment_pin_receipt.json"
+  assert_error_unverified "${root}/m7/paddlefleet_alignment_pin_receipt.json"
+
+  # Permanent HTTP 401 (also says RPC failed) must not retry.
+  write_git_wrapper "${root}/bin-401" 401
+  expect_fail "${root}/m8" "git fetch failed" \
+    env PATH="${root}/bin-401:${root}/bin:${PATH}" \
+        ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
+        PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
+        bash "${script}" --dest "${root}/m8"
+  [[ "$(cat "${root}/bin-401/count")" == 1 ]]
+  [[ ! -f "${root}/bin-401/stale" ]]
+  assert_error_unverified "${root}/m8/paddlefleet_alignment_pin_receipt.json"
+
+  # First two fetches emit Swift 34038640242 curl-56 / early-EOF and leave
+  # a dest sentinel; the next fetch must see a clean dest. Third fetch is
+  # real git. Depth=1 and detached pin, not a default-branch clone.
+  write_git_wrapper "${root}/bin-retry" retry
+  run PATH="${root}/bin-retry:${root}/bin:${PATH}" \
+      ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
+      PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
+      bash "${script}" --dest "${root}/ok-retry"
+  [[ "$(cat "${root}/bin-retry/count")" == 3 ]]
+  [[ ! -f "${root}/bin-retry/stale" ]]
+  [[ ! -e "${root}/ok-retry/PaddleFleet/.retry-sentinel" ]]
+  assert_pin_checkout "${root}/ok-retry/PaddleFleet" "${sha_b}"
+  python3 - "${root}/ok-retry/paddlefleet_alignment_pin_receipt.json" "${sha_b}" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["status"] == "ok"
+assert doc["source"]["actual_commit"] == sys.argv[2]
+assert doc["source"]["commit_verified"] is True
+print("ok-retry receipt exact HEAD verified")
+PY
+
+  # Exhausted transient retries: wrapper count is 3, dest cleaned between
+  # attempts, error receipt stays unverified.
+  write_git_wrapper "${root}/bin-fail" exhaust
+  expect_fail "${root}/m9" "git fetch failed" \
+    env PATH="${root}/bin-fail:${root}/bin:${PATH}" \
+        ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
+        PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
+        bash "${script}" --dest "${root}/m9"
+  [[ "$(cat "${root}/bin-fail/count")" == 3 ]]
+  [[ ! -f "${root}/bin-fail/stale" ]]
+  assert_error_unverified "${root}/m9/paddlefleet_alignment_pin_receipt.json"
 
   run ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
       PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
@@ -631,7 +819,7 @@ assert "MinimaxV2.5_EP2" in doc["cases_preserved"]
 assert "GLM45Air_EP2" in doc["cases_preserved"]
 print("ok-url receipt fields checked")
 PY
-  [[ "$(git -C "${root}/ok-url/PaddleFleet" rev-parse HEAD)" == "${sha_b}" ]]
+  assert_pin_checkout "${root}/ok-url/PaddleFleet" "${sha_b}"
 
   run ALIGNMENT_PADDLEFLEET_MODE=stack-paired \
       PADDLEFLEET_PIN_SHA="${sha_b}" PADDLEFLEET_GIT_URL="${root}/upstream" \
@@ -680,6 +868,7 @@ PY
   grep -q "PADDLEFLEET_WHEEL_ORIGIN=source_tree" "${root}/ok-source/paddlefleet_alignment_pin.env"
   grep -q "PADDLEFLEET_WHEEL_DIGEST_VERIFIED=false" "${root}/ok-source/paddlefleet_alignment_pin.env"
   grep -q "PADDLEFLEET_SOURCE_COMMIT=${sha_b}" "${root}/ok-source/paddlefleet_alignment_pin.env"
+  assert_pin_checkout "${root}/ok-source/PaddleFleet" "${sha_b}"
 
   grep -q 'CodeSync/develop/PaddleFleet.tar' "${script}"
   grep -q 'PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl' "${script}"
