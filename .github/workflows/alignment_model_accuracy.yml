@@ -239,6 +239,8 @@ jobs:
             echo "using $whl"
           done
           python -m pip install uv
+          bash Megatron-LM/scripts/prepare_paddlefleet_ops_submodules.sh \
+            "$PADDLEFLEET_OPS_WHEEL_PATH" PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
           bash PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
           bash -x PaddleFleet/scripts/alignment_model_accuracy/run_alignment_test.sh
 
