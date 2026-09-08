@@ -11,10 +11,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import (
-    apply_prefix_mapping,
-    replace_prefix_for_sharding,
-)
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
@@ -31,7 +28,7 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -64,9 +61,7 @@ if HAVE_TE:
 else:
     TESpecProvider = None
 
-from megatron.core.transformer.pipeline_parallel_layer_layout import (
-    PipelineParallelLayerLayout,
-)
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
 def tie_word_embeddings_state_dict(
@@ -1054,9 +1049,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.submodules.mtp_model_layer, "submodules"
         ):
             from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
-            from megatron.core.transformer.transformer_layer import (
-                TransformerLayerSubmodules,
-            )
+            from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 
             layer_submodules = None
             if isinstance(
@@ -1124,9 +1117,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and hybrid_submodules is not None:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
-            from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                validate_segment_layers,
-            )
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = HybridStack(
                 config=self.config,
@@ -1215,9 +1206,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
 
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True
-        )
+        _tp_size = 1 if self.tp_group is None else self.tp_group.size()
+        if not (_use_accuracy_compatible() and _tp_size <= 1):
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
         # which happens after detach() with mtp_detach_heads. Activation
         # checkpointing (CheckpointFunction.apply) requires at least one input tensor
@@ -1234,14 +1227,17 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
+        _tp_size = 1 if self.tp_group is None else self.tp_group.size()
         decoder_input = apply_module(self.enorm)(decoder_input)
-        decoder_input = make_viewless_tensor(
-            inp=decoder_input, requires_grad=True, keep_graph=True
-        )
+        if not (_use_accuracy_compatible() and _tp_size <= 1):
+            decoder_input = make_viewless_tensor(
+                inp=decoder_input, requires_grad=True, keep_graph=True
+            )
         hidden_states = apply_module(self.hnorm)(hidden_states)
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True
-        )
+        if not (_use_accuracy_compatible() and _tp_size <= 1):
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
@@ -1252,7 +1248,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                 hidden_states, self.tp_group, self.config
             )
-        else:
+        elif not (_use_accuracy_compatible() and _tp_size <= 1):
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group
             )

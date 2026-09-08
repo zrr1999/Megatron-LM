@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_w
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -941,9 +941,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # won't result in memory savings (like the data loader, or
         # p2p_communication), it serves to document the origin of this
         # 'view' tensor.
-        output = make_viewless_tensor(
-            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
-        )
+        if _use_accuracy_compatible() and self.config.tensor_model_parallel_size <= 1:
+            output = hidden_states
+        else:
+            output = make_viewless_tensor(
+                inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+            )
 
         return output
 
