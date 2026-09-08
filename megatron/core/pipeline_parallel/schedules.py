@@ -24,6 +24,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
+from megatron.core.transformer.module import _use_accuracy_compatible
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -177,6 +178,11 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
+    if _use_accuracy_compatible():
+        # Compatibility fallback: callers supply only a tensor and deallocation flag.
+        _tp_size = int(parallel_state.get_tensor_model_parallel_world_size() or 1)
+        if _tp_size <= 1:
+            return
 
     # Handle dict format (multi-module pipelines)
     if isinstance(out, dict):
@@ -568,7 +574,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
     if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
+        _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
+        if config.deallocate_pipeline_outputs and (
+            not _use_accuracy_compatible() or _tp_size > 1
+        ):
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
@@ -641,7 +650,10 @@ def backward_step_multimodule(
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
         if output_tensor_module is not None and output_tensor_module.requires_grad:
-            if config.deallocate_pipeline_outputs:
+            _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
+            if config.deallocate_pipeline_outputs and (
+                not _use_accuracy_compatible() or _tp_size > 1
+            ):
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:
                 torch.autograd.backward(

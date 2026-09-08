@@ -510,6 +510,10 @@ def scatter_to_tensor_model_parallel_region(input_, group=None):
 def gather_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    from megatron.core.transformer.module import _use_accuracy_compatible
+
+    if _use_accuracy_compatible() and (group is None or group.size() <= 1):
+        return input_
     return _GatherFromModelParallelRegion.apply(input_, group)
 
 

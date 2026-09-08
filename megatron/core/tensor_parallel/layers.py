@@ -59,6 +59,53 @@ except ImportError:
 
 from megatron.core.transformer.module import _use_accuracy_compatible
 
+
+class _EmbedFp32MainGrad(torch.autograd.Function):
+    """UAC embedding lookup whose wgrad lands in fp32 main_grad.
+
+    Forward is ``weight[ids]`` (bf16 activation unchanged). Backward uses a
+    unique-row clone plus ``autograd.grad``, then ``index_add_`` into an fp32
+    ``main_grad``. Returns None for weight.grad so MixPrecision cannot add_(bf16).
+    """
+
+    @staticmethod
+    def forward(ctx, weight, ids):
+        ctx.save_for_backward(ids)
+        ctx.weight_ref = weight
+        return weight[ids]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (ids,) = ctx.saved_tensors
+        weight = ctx.weight_ref
+        prev = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        try:
+            ids_flat = ids.reshape(-1)
+            unique_ids, inv = torch.unique(ids_flat, return_inverse=True)
+            uniq_w = weight.detach()[unique_ids].clone().requires_grad_(True)
+            looked = uniq_w[inv.reshape(ids.shape)]
+            (gw,) = torch.autograd.grad(
+                looked, uniq_w, grad_outputs=grad_output, allow_unused=True
+            )
+        finally:
+            torch.set_grad_enabled(prev)
+        if gw is None:
+            return None, None
+        fp = gw.float()
+        if hasattr(weight, "main_grad") and weight.main_grad is not None:
+            weight.main_grad.index_add_(0, unique_ids, fp)
+        else:
+            acc = torch.zeros(
+                weight.shape, dtype=torch.float32, device=weight.device
+            )
+            acc.index_add_(0, unique_ids, fp)
+            weight.main_grad = acc
+        if hasattr(weight, "grad_added_to_main_grad"):
+            weight.grad_added_to_main_grad = True
+        return None, None
+
+
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
@@ -299,7 +346,15 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_
         # Get the embeddings.
         if self.deterministic_mode:
-            output_parallel = self.weight[masked_input]
+            _tp_size = 1 if self.tp_group is None else self.tp_group.size()
+            if (
+                _use_accuracy_compatible()
+                and _tp_size <= 1
+                and os.environ.get("MODEL_REPRO_TWO_FP32_ACCUM", "") == "1"
+            ):
+                output_parallel = _EmbedFp32MainGrad.apply(self.weight, masked_input)
+            else:
+                output_parallel = self.weight[masked_input]
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, self.weight)
@@ -740,6 +795,17 @@ def linear_with_grad_accumulation_and_async_allreduce(
     """
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+    _tp_size = 1 if tp_group is None else tp_group.size()
+    if (
+        _use_accuracy_compatible()
+        and _tp_size <= 1
+        and not sequence_parallel
+        and not allreduce_dgrad
+    ):
+        output = torch.matmul(input, weight.t())
+        if bias is not None:
+            output = output + bias
+        return output
 
     args = [
         input,
@@ -1072,6 +1138,11 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.disable_grad_reduce
         ):
             input_parallel = input_
+        elif (
+            _use_accuracy_compatible()
+            and (self.tp_group is None or self.tp_group.size() <= 1)
+        ):
+            input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
 
@@ -1117,7 +1188,10 @@ class ColumnParallelLinear(torch.nn.Module):
         if runtime_gather_output is not None:
             gather_output = runtime_gather_output
 
-        if gather_output:
+        if gather_output and (
+            not _use_accuracy_compatible()
+            or (self.tp_group is not None and self.tp_group.size() > 1)
+        ):
             # All-gather across the partitions.
             if self.use_inference_optimized_all_gather and not self.training:
                 # Deferred to avoid circular import: inference_layers → TE → layers.
@@ -1396,6 +1470,11 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
+        elif (
+            _use_accuracy_compatible()
+            and (self.tp_group is None or self.tp_group.size() <= 1)
+        ):
+            output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         if not self.skip_bias_add:
