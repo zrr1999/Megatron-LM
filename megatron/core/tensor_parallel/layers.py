@@ -70,12 +70,14 @@ class _EmbedFp32MainGrad(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, weight, ids):
+        """Look up embeddings while retaining the accumulator owner."""
         ctx.save_for_backward(ids)
         ctx.weight_ref = weight
         return weight[ids]
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Accumulate repeated-index gradients into the FP32 master buffer."""
         (ids,) = ctx.saved_tensors
         weight = ctx.weight_ref
         prev = torch.is_grad_enabled()
@@ -85,9 +87,7 @@ class _EmbedFp32MainGrad(torch.autograd.Function):
             unique_ids, inv = torch.unique(ids_flat, return_inverse=True)
             uniq_w = weight.detach()[unique_ids].clone().requires_grad_(True)
             looked = uniq_w[inv.reshape(ids.shape)]
-            (gw,) = torch.autograd.grad(
-                looked, uniq_w, grad_outputs=grad_output, allow_unused=True
-            )
+            (gw,) = torch.autograd.grad(looked, uniq_w, grad_outputs=grad_output, allow_unused=True)
         finally:
             torch.set_grad_enabled(prev)
         if gw is None:
@@ -96,9 +96,7 @@ class _EmbedFp32MainGrad(torch.autograd.Function):
         if hasattr(weight, "main_grad") and weight.main_grad is not None:
             weight.main_grad.index_add_(0, unique_ids, fp)
         else:
-            acc = torch.zeros(
-                weight.shape, dtype=torch.float32, device=weight.device
-            )
+            acc = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
             acc.index_add_(0, unique_ids, fp)
             weight.main_grad = acc
         if hasattr(weight, "grad_added_to_main_grad"):
@@ -284,7 +282,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode or _use_accuracy_compatible()
+        self.deterministic_mode = config.deterministic_mode or config.use_accuracy_compatible
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
@@ -347,11 +345,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Get the embeddings.
         if self.deterministic_mode:
             _tp_size = 1 if self.tp_group is None else self.tp_group.size()
-            if (
-                _use_accuracy_compatible()
-                and _tp_size <= 1
-                and os.environ.get("MODEL_REPRO_TWO_FP32_ACCUM", "") == "1"
-            ):
+            if self.config.use_accuracy_compatible and _tp_size <= 1:
                 output_parallel = _EmbedFp32MainGrad.apply(self.weight, masked_input)
             else:
                 output_parallel = self.weight[masked_input]
@@ -1138,10 +1132,7 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.disable_grad_reduce
         ):
             input_parallel = input_
-        elif (
-            _use_accuracy_compatible()
-            and (self.tp_group is None or self.tp_group.size() <= 1)
-        ):
+        elif _use_accuracy_compatible() and (self.tp_group is None or self.tp_group.size() <= 1):
             input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
@@ -1470,10 +1461,7 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
-        elif (
-            _use_accuracy_compatible()
-            and (self.tp_group is None or self.tp_group.size() <= 1)
-        ):
+        elif _use_accuracy_compatible() and (self.tp_group is None or self.tp_group.size() <= 1):
             output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)

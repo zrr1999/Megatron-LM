@@ -1,7 +1,9 @@
 """CUDA unit tests for native C2 TP1 accuracy-compatible migration."""
+
 from __future__ import annotations
 
 import ast
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -78,8 +80,10 @@ def _load_named(rel: str, name: str, extra_ns=None, class_name=None):
     target = next(
         node
         for node in body
-        if isinstance(node, ast.ClassDef) and node.name == name
-        or isinstance(node, ast.FunctionDef) and node.name == name
+        if isinstance(node, ast.ClassDef)
+        and node.name == name
+        or isinstance(node, ast.FunctionDef)
+        and node.name == name
     )
     if isinstance(target, ast.FunctionDef):
         target.decorator_list = []
@@ -96,9 +100,7 @@ def _load_named(rel: str, name: str, extra_ns=None, class_name=None):
         "get_tensor_model_parallel_group_if_none": lambda g: g,
         "LinearWithGradAccumulationAndAsyncCommunication": _SentinelApply,
         "_GatherFromModelParallelRegion": _SentinelGather,
-        "parallel_state": SimpleNamespace(
-            get_tensor_model_parallel_world_size=lambda: _TP["size"]
-        ),
+        "parallel_state": SimpleNamespace(get_tensor_model_parallel_world_size=lambda: _TP["size"]),
         "custom_backward": _custom_backward,
         "Variable": torch.autograd.Variable,
     }
@@ -108,27 +110,18 @@ def _load_named(rel: str, name: str, extra_ns=None, class_name=None):
     return ns[name]
 
 
-_EmbedFp32MainGrad = _load_named(
-    "megatron/core/tensor_parallel/layers.py",
-    "_EmbedFp32MainGrad",
-)
+_EmbedFp32MainGrad = _load_named("megatron/core/tensor_parallel/layers.py", "_EmbedFp32MainGrad")
 linear_with_grad_accumulation_and_async_allreduce = _load_named(
-    "megatron/core/tensor_parallel/layers.py",
-    "linear_with_grad_accumulation_and_async_allreduce",
+    "megatron/core/tensor_parallel/layers.py", "linear_with_grad_accumulation_and_async_allreduce"
 )
 linear_with_grad_accumulation_and_async_allreduce.warned = True
 gather_from_tensor_model_parallel_region = _load_named(
-    "megatron/core/tensor_parallel/mappings.py",
-    "gather_from_tensor_model_parallel_region",
+    "megatron/core/tensor_parallel/mappings.py", "gather_from_tensor_model_parallel_region"
 )
 deallocate_output_tensor = _load_named(
-    "megatron/core/pipeline_parallel/schedules.py",
-    "deallocate_output_tensor",
+    "megatron/core/pipeline_parallel/schedules.py", "deallocate_output_tensor"
 )
-backward_step = _load_named(
-    "megatron/core/pipeline_parallel/schedules.py",
-    "backward_step",
-)
+backward_step = _load_named("megatron/core/pipeline_parallel/schedules.py", "backward_step")
 
 
 def _ref_embed_fp32_wgrad(weight_bf16, ids, grad_out):
@@ -144,19 +137,91 @@ def _cuda_bf16(values, shape, device):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestEmbedFp32MainGradCuda(unittest.TestCase):
+    def test_embedding_configuration_controls_gradient_destination(self):
+        forward = _load_named(
+            "megatron/core/tensor_parallel/layers.py",
+            "forward",
+            {"_EmbedFp32MainGrad": _EmbedFp32MainGrad},
+            class_name="VocabParallelEmbedding",
+        )
+        ids = torch.tensor([1, 1, 3], device="cuda")
+        instances = []
+        for enabled in (False, True):
+            weight = torch.ones(4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+            instances.append(
+                SimpleNamespace(
+                    config=SimpleNamespace(use_accuracy_compatible=enabled),
+                    deterministic_mode=True,
+                    tp_group=_FakeGroup(1),
+                    weight=weight,
+                    reduce_scatter_embeddings=False,
+                )
+            )
+        for instance in instances:
+            enabled = instance.config.use_accuracy_compatible
+            with patch.dict(
+                os.environ,
+                {
+                    "MODEL_REPRO_TWO_FP32_ACCUM": str(int(not enabled)),
+                    "USE_ACCURACY_COMPATIBLE": str(int(not enabled)),
+                },
+            ):
+                output = forward(instance, ids)
+            output.sum().backward()
+            expected = torch.zeros(4, 8, device="cuda", dtype=torch.float32)
+            expected[1] = 2
+            expected[3] = 1
+            if enabled:
+                self.assertIsNone(instance.weight.grad)
+                torch.testing.assert_close(instance.weight.main_grad, expected, atol=0, rtol=0)
+            else:
+                torch.testing.assert_close(instance.weight.grad.float(), expected, atol=0, rtol=0)
+                self.assertEqual(torch.count_nonzero(instance.weight.main_grad).item(), 0)
+
     def test_repeated_indices_matches_independent_full_table_autograd(self):
         device = torch.device("cuda")
         vocab, dim = 8, 4
         weight = _cuda_bf16(
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32],
+            [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                23,
+                24,
+                25,
+                26,
+                27,
+                28,
+                29,
+                30,
+                31,
+                32,
+            ],
             (vocab, dim),
             device,
         )
         ids = torch.tensor([[1, 3, 1, 5], [3, 3, 0, 1]], device=device)
-        grad_out = _cuda_bf16(
-            list(range(1, 33)), (2, 4, dim), device
-        )
+        grad_out = _cuda_bf16(list(range(1, 33)), (2, 4, dim), device)
         w = weight.clone().requires_grad_(True)
         w.main_grad = torch.zeros(vocab, dim, device=device, dtype=torch.float32)
         w.grad_added_to_main_grad = False
@@ -174,9 +239,7 @@ class TestEmbedFp32MainGradCuda(unittest.TestCase):
     def test_main_grad_accumulates_two_backwards_unused_rows_stay_zero(self):
         device = torch.device("cuda")
         vocab, dim = 6, 3
-        weight = _cuda_bf16(
-            list(range(1, 19)), (vocab, dim), device
-        )
+        weight = _cuda_bf16(list(range(1, 19)), (vocab, dim), device)
         ids_a = torch.tensor([2, 2, 4], device=device)
         ids_b = torch.tensor([4, 1, 2], device=device)
         go_a = _cuda_bf16([1, 2, 3, 4, 5, 6, 7, 8, 9], (3, dim), device)
@@ -211,15 +274,9 @@ class TestLinearTp1Native(unittest.TestCase):
     def test_tp1_forward_dgrad_wgrad_bias_matches_f_linear(self):
         device = torch.device("cuda")
         x = _cuda_bf16(
-            [1, 2, 0, -1, 1, 0, 2, 1, -2, 0, 1, 1, 2, 0, 1],
-            (5, 3),
-            device,
+            [1, 2, 0, -1, 1, 0, 2, 1, -2, 0, 1, 1, 2, 0, 1], (5, 3), device
         ).requires_grad_(True)
-        w = _cuda_bf16(
-            [1, 0, -1, 0, 1, 1, 1, -1, 0, 0, 1, -1],
-            (4, 3),
-            device,
-        ).requires_grad_(True)
+        w = _cuda_bf16([1, 0, -1, 0, 1, 1, 1, -1, 0, 0, 1, -1], (4, 3), device).requires_grad_(True)
         b = _cuda_bf16([1, -1, 0, 2], (4,), device).requires_grad_(True)
         out = linear_with_grad_accumulation_and_async_allreduce(
             x, w, b, False, False, False, None, 0, _FakeGroup(1)
@@ -230,7 +287,9 @@ class TestLinearTp1Native(unittest.TestCase):
         ref = F.linear(xref, wref, bref)
         torch.testing.assert_close(out, ref, atol=0, rtol=0)
         self.assertIsNone(_SentinelApply.last)
-        go = _cuda_bf16([1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1], (5, 4), device)
+        go = _cuda_bf16(
+            [1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1], (5, 4), device
+        )
         out.backward(go)
         F.linear(xref, wref, bref).backward(go)
         torch.testing.assert_close(x.grad, xref.grad, atol=0, rtol=0)
