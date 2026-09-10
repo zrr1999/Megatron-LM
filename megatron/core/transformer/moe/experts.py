@@ -1180,16 +1180,17 @@ class _SeqMLPProxy:
     Required by upper layers (e.g. ms-swift's ``GPTBridge._set_mlp_state``) that
     probe ``mg_mlp.linear_fc1`` / ``linear_fc2`` like GroupedMLP.
     """
+
     def __init__(self, experts, attr):
         self._experts = experts
         self._attr = attr
 
     def __getattr__(self, name):
         if name.startswith('weight'):
-            idx = int(name[len('weight'):])
+            idx = int(name[len('weight') :])
             return getattr(self._experts[idx], self._attr).weight
         if name.startswith('bias'):
-            idx = int(name[len('bias'):])
+            idx = int(name[len('bias') :])
             return getattr(self._experts[idx], self._attr).bias
         raise AttributeError(name)
 
@@ -1275,8 +1276,7 @@ class SequentialMLP(MegatronModule):
                         return grad
                     with torch.no_grad():
                         wg = torch.matmul(
-                            grad.detach().to(torch.float32).transpose(0, 1),
-                            _i.to(torch.float32),
+                            grad.detach().to(torch.float32).transpose(0, 1), _i.to(torch.float32)
                         )
                         prev = getattr(_w, '_run_torch_expert_fp32_wgrad', None)
                         if prev is None:
@@ -1292,7 +1292,6 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             for lin in (expert.linear_fc1, expert.linear_fc2):
                 lin.register_forward_hook(_make_forward_hook(lin))
-
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
@@ -1349,12 +1348,29 @@ class SequentialMLP(MegatronModule):
             output_local_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+                # The unfused Paddle expert pads tiny GEMMs to 32 rows. The
+                # grouped-storage fallback uses real token counts instead.
+                num_real_tokens = tokens.shape[0]
+                pad_small_expert = (
+                    self.config.use_accuracy_compatible
+                    and not self.config.moe_grouped_gemm
+                    and not (self.config.fp8 or self.config.fp4)
+                    and 0 < num_real_tokens < 17
+                )
+                if pad_small_expert:
+                    num_pad_tokens = 32 - num_real_tokens
+                    tokens = torch.cat(
+                        (tokens, tokens.new_zeros(num_pad_tokens, tokens.shape[1])), dim=0
+                    )
+                    probs = torch.cat((probs, probs.new_zeros(num_pad_tokens)), dim=0)
                 if self.config.fp8 or self.config.fp4:
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:
                     output, output_bias = expert(tokens, probs)
+                if pad_small_expert:
+                    output = output[:num_real_tokens]
                 output_local_list.append(output)
 
             output_local = torch.cat(output_local_list, dim=0)

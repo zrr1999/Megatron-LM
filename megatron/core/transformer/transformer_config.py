@@ -288,6 +288,13 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    accuracy_compatible_loss_sum_dtype: Literal["float32", "float64"] = "float64"
+    """Token-loss accumulation dtype in accuracy-compatible training.
+
+    Preserve FP64 accumulation by default. Model providers can select FP32
+    when that is the reference loss-reduction contract.
+    """
+
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
