@@ -50,12 +50,37 @@ except ImportError:
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
+from .reproducible_norm import ReproducibleL2Norm
+
+
+@torch.no_grad()
+def get_reproducible_grad_norm_bins(
+    grads_for_norm: List[torch.Tensor],
+    grad_stats_parallel_group: torch.distributed.ProcessGroup | None,
+) -> torch.Tensor:
+    """Reduce exact FP32-square bins using the existing gradient ownership groups."""
+    grads_for_norm = list(grads_for_norm)
+    data_parallel_group = None
+    for grad in grads_for_norm:
+        data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+    grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
+    accumulator = ReproducibleL2Norm(grads_for_norm[0].device if grads_for_norm else None)
+    bins = accumulator.zeros()
+    for grad in grads_for_norm:
+        if grad.layout != torch.strided:
+            raise TypeError("Reproducible clipping requires dense FP32 gradients")
+        bins = accumulator.accumulate(bins, grad)
+    if data_parallel_group:
+        torch.distributed.all_reduce(bins, group=data_parallel_group)
+    torch.distributed.all_reduce(bins, group=grad_stats_parallel_group)
+    return bins
 
 
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    use_accuracy_compatible: bool = False,
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
@@ -79,6 +104,12 @@ def get_grad_norm_fp32(
 
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
+
+    if use_accuracy_compatible:
+        if float(norm_type) != 2.0:
+            raise ValueError("Reproducible clipping supports only the L2 norm")
+        bins = get_reproducible_grad_norm_bins(grads_for_norm, grad_stats_parallel_group)
+        return ReproducibleL2Norm(bins.device).finish(bins)[0]
 
     data_parallel_group = None
     for grad in grads_for_norm:
@@ -184,12 +215,14 @@ def clip_grad_by_total_norm_fp32(
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
-        assert (
-            multi_tensor_scale_tensor_impl is not None
-        ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
-        multi_tensor_applier(
-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-        )
+        if multi_tensor_scale_tensor_impl is not None:
+            multi_tensor_applier(
+                multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+            )
+        else:
+            multi_tensor_applier(
+                multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff.item()
+            )
     elif clip_coeff < 1.0:
         multi_tensor_applier(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff

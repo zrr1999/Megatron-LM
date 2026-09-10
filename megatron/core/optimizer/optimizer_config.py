@@ -371,6 +371,9 @@ class OptimizerConfig:
     ################
     # Miscellaneous
     ################
+    use_accuracy_compatible: bool = False
+    """Use a partition-independent FP32 gradient norm when clipping is enabled."""
+
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 

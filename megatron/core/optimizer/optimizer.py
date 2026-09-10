@@ -48,9 +48,15 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    get_grad_norm_fp32,
+    get_reproducible_grad_norm_bins,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from .reproducible_norm import ReproducibleL2Norm
 
 logger = getLogger(__name__)
 
@@ -296,7 +302,10 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_accuracy_compatible=self.config.use_accuracy_compatible
+            and self.config.clip_grad > 0,
         )
         return total_norm
 
@@ -308,7 +317,10 @@ class MegatronOptimizer(ABC):
             if self.has_grad_norm_group(grad_norm_group):
                 grouped_grads = self.get_grads_for_grad_norm(grad_norm_group)
                 group_grad_norm = get_grad_norm_fp32(
-                    grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                    grouped_grads,
+                    grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+                    use_accuracy_compatible=self.config.use_accuracy_compatible
+                    and self.config.clip_grad > 0,
                 )
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
@@ -326,7 +338,10 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm,
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+            use_accuracy_compatible=self.config.use_accuracy_compatible
+            and self.config.clip_grad > 0,
         )
 
         if clip_grad > 0.0 and params:
@@ -1567,7 +1582,20 @@ class ChainedOptimizer(MegatronOptimizer):
         return self.chained_optimizers[0].get_grad_stats_parallel_group()
 
     @torch.no_grad()
+    def _get_reproducible_grad_norm(self, grad_norm_group=None):
+        bins = None
+        for optimizer in self.chained_optimizers:
+            part = get_reproducible_grad_norm_bins(
+                optimizer.get_grads_for_grad_norm(grad_norm_group),
+                optimizer.get_grad_stats_parallel_group(),
+            )
+            bins = part if bins is None else bins + part
+        return ReproducibleL2Norm(bins.device).finish(bins)[0]
+
+    @torch.no_grad()
     def get_grad_norm(self):
+        if self.config.use_accuracy_compatible and self.config.clip_grad > 0:
+            return self._get_reproducible_grad_norm()
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
         if self.grads_states_parallel_group_is_shared():
@@ -1631,6 +1659,8 @@ class ChainedOptimizer(MegatronOptimizer):
     def _get_grad_norm_for_group(self, grad_norm_group: str):
         """Compute gradient norm for a named parameter group."""
         _validate_grad_norm_group(grad_norm_group)
+        if self.config.use_accuracy_compatible and self.config.clip_grad > 0:
+            return self._get_reproducible_grad_norm(grad_norm_group)
         if self.grads_states_parallel_group_is_shared():
             grouped_grads = []
             for optimizer in self.chained_optimizers:
